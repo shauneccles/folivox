@@ -698,14 +698,22 @@ def _narration(bible: Bible, narr: dict[str, int]) -> None:
         bible.narration = top if top in ("first", "third", "mixed") else bible.narration
 
 
+def _two_full_names(a: str, b: str) -> bool:
+    """Two different names of several words each (Robert Cohn, Robert Prentiss): a short alias they share ("Robert",
+    which a strand that never met the other gives freely) does not make them one person."""
+    a, b = norm_name(a), norm_name(b)
+    return " " in a and " " in b and a != b
+
+
 def merge_bibles(bible: Bible, others: list[Bible]) -> Bible:
     """Fold bibles read side by side (one per strand of the book) into ``bible``: a character is the same person as
-    one already there when :meth:`Bible.find` matches one of its names, as when a window's answer is merged, and is
-    folded in with :func:`merge_characters`."""
+    one already there when :meth:`Bible.find` matches its name, or one of its aliases unless both have full names
+    that differ, and is folded in with :func:`merge_characters`. A pair missed here is left to
+    :func:`join_same_people`; a wrong join could not be undone."""
     for other in others:
         for c in other.characters:
             keep = bible.find(c.name, c.gender) or next((x for x in (bible.find(a, c.gender) for a in c.aliases)
-                                                         if x), None)
+                                                         if x and not _two_full_names(x.name, c.name)), None)
             if keep is None:
                 c.id = 0
                 bible.characters.append(c)

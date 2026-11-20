@@ -216,6 +216,15 @@ def test_merging_strand_bibles_finds_a_character_under_an_alias():
     assert "Анна Ивановна" in into.characters[0].aliases
 
 
+def test_merging_strand_bibles_keeps_two_people_who_share_a_first_name_apart():
+    # a strand that never met Robert Cohn calls Robert Prentiss "Robert" too (seen in a real run)
+    into = ml.Bible("en", characters=[ml.Character("Robert Cohn", aliases=["Robert", "Cohn"], gender="m", lines=34)])
+    other = ml.Bible("en", characters=[ml.Character("Robert Prentiss", aliases=["Robert"], gender="m", lines=6),
+                                       ml.Character("Cohn", gender="m", lines=2)])
+    ml.merge_bibles(into, [other])
+    assert [(x.name, x.lines) for x in into.characters] == [("Robert Cohn", 36), ("Robert Prentiss", 6)]
+
+
 def test_the_estimate_prices_the_reading_calls_at_half_with_batch_reading():
     chapters = book(2)
     bible = ml.Bible()
