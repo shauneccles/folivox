@@ -169,3 +169,57 @@ def test_a_run_points_folivox_at_the_proxy_and_keeps_the_users_settings():
     cmd = ev.folivox_command(Path("b.txt"), "anthropic", "claude-haiku-5-5", True, ["--fresh"])
     assert cmd[3:] == ["markup", "auto", "b.txt", "--llm", "anthropic", "--model", "claude-haiku-5-5", "--best",
                        "--fresh"]
+
+
+
+class BatchUpstream(BaseHTTPRequestHandler):
+    """Message Batches as the API answers them: an ended batch whose results_url is absolute, then JSON lines."""
+
+    def log_message(self, *a):
+        pass
+
+    def send(self, data: bytes, kind="application/json"):
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        if self.path.endswith("/results"):
+            lines = [{"custom_id": "a", "result": {"type": "succeeded", "message": {
+                         "model": "some-model", "usage": {"input_tokens": 100, "output_tokens": 50,
+                                                          "cache_read_input_tokens": 0,
+                                                          "cache_creation_input_tokens": 0}}}},
+                     {"custom_id": "b", "result": {"type": "expired"}}]
+            self.send("\n".join(json.dumps(x) for x in lines).encode(), "application/binary")
+        else:
+            self.send(json.dumps({"id": "msgbatch_1", "processing_status": "ended",
+                                  "results_url": f"{base}/v1/messages/batches/msgbatch_1/results"}).encode())
+
+
+def test_batch_results_go_through_the_proxy_and_cost_half(tmp_path):
+    up = ThreadingHTTPServer(("127.0.0.1", 0), BatchUpstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{up.server_address[1]}"
+    proxy = ev.Proxy({"anthropic": base}, tmp_path / "calls.jsonl")
+    try:
+        with urllib.request.urlopen(proxy.url("anthropic", "Tale") + "/v1/messages/batches/msgbatch_1") as r:
+            url = json.loads(r.read())["results_url"]
+        assert url.startswith(proxy.url("anthropic", "Tale"))  # the SDK fetches the results through the proxy
+        with urllib.request.urlopen(url) as r:
+            r.read()
+    finally:
+        proxy.close()
+        up.shutdown()
+    s = ev.spend(tmp_path, {"some-model": {"in": 1.0, "out": 2.0}})
+    assert s["calls"] == 1 and s["batch_calls"] == 1 and s["usd"] == pytest.approx((100 + 50 * 2) / 1e6 / 2)
+
+
+def test_folivox_options_after_the_double_dash_reach_the_run(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(ev, "run", lambda *a: seen.setdefault("extra", a[7]))
+    ev.main(["--work", str(tmp_path), "run", "x", "--llm", "anthropic", "--model", "m", "--", "--batch",
+             "--max-cost", "1"])
+    assert seen["extra"] == ["--batch", "--max-cost", "1"]

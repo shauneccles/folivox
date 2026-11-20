@@ -194,6 +194,24 @@ class Proxy:
         self.server.shutdown()
         self.server.server_close()
 
+    def log_batch(self, kind: str, book: str, rest: str, data: bytes, t0: float) -> None:
+        """One line per answered request of a Message Batch's results (billed at the batch price)."""
+        recs = []
+        for line in data.decode("utf-8", "replace").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            res = r.get("result") or {}
+            if res.get("type") != "succeeded":
+                continue
+            msg = res.get("message") or {}
+            recs.append({"t": round(t0, 3), "dt": 0, "kind": kind, "book": book, "path": rest, "status": 200,
+                         "model": msg.get("model"), "usage": usage_of(kind, msg), "batch": True})
+        with self.lock, open(self.log, "a", encoding="utf-8") as f:
+            for rec in recs:
+                f.write(json.dumps(rec) + "\n")
+
     def forward(self, h: BaseHTTPRequestHandler, method: str) -> None:
         parts = h.path.split("/", 3)
         if len(parts) < 4 or parts[1] not in self.upstreams:
@@ -215,6 +233,11 @@ class Proxy:
             status, data, rh = e.code, e.read(), e.headers
         except (OSError, http.client.HTTPException) as e:
             status, data, rh = 502, json.dumps({"error": f"proxy: {type(e).__name__}"}).encode(), None
+        if status == 200 and b'"results_url"' in data:  # Message Batches: fetch the results through here too
+            up = self.upstreams[kind].rstrip("/")
+            data = data.replace(json.dumps(up)[1:-1].encode(), self.url(kind, book).encode())
+        if method == "GET" and status == 200 and rest.split("?")[0].endswith("/results"):
+            self.log_batch(kind, book, rest, data, t0)
         if method == "POST" and body:
             rec = {"t": round(t0, 3), "dt": round(time.time() - t0, 3), "kind": kind, "book": book,
                    "path": rest, "status": status}
@@ -480,7 +503,8 @@ def score(work: Path, cfg: dict, label: str) -> dict:
 def spend(rundir: Path, prices: dict) -> dict:
     """Tokens and USD of a run from the proxy's log (USD only for a model with a price in eval.json)."""
     tot: collections.Counter = collections.Counter()
-    calls = errors = 0
+    half: collections.Counter = collections.Counter()  # Message Batches tokens, billed at half price
+    calls = errors = batch_calls = 0
     model = None
     log = rundir / "calls.jsonl"
     for line in log.read_text(encoding="utf-8").splitlines() if log.is_file() else []:
@@ -493,12 +517,19 @@ def spend(rundir: Path, prices: dict) -> dict:
             errors += 1
         for k, v in (r.get("usage") or {}).items():
             tot[k] += v
+            if r.get("batch"):
+                half[k] += v
+        batch_calls += bool(r.get("batch"))
     p = prices.get(model or "")
     usd = None
     if p:
-        usd = (tot["input"] * p["in"] + tot["output"] * p["out"] + tot["cache_read"] * p.get("cache_read", p["in"])
-               + tot["cache_write"] * p.get("cache_write", p["in"])) / 1e6
-    return {"calls": calls, "http_errors": errors, "model": model, **dict(tot), "usd": usd}
+        def cost(t):
+            return (t["input"] * p["in"] + t["output"] * p["out"] + t["cache_read"] * p.get("cache_read", p["in"])
+                    + t["cache_write"] * p.get("cache_write", p["in"])) / 1e6
+
+        usd = cost(tot) - 0.5 * cost(half)
+    return {"calls": calls, "http_errors": errors, "model": model, **dict(tot), "batch_calls": batch_calls,
+            "usd": usd}
 
 
 def report(work: Path, cfg: dict, labels: list[str] | None = None) -> list[dict]:
@@ -559,7 +590,11 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("report", help="accuracy, time, tokens and cost of the scored runs")
     p.add_argument("labels", nargs="*")
     p.add_argument("--json", action="store_true")
-    a = ap.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    rest = argv[argv.index("--") + 1:] if "--" in argv else []  # argparse would not take them after the options
+    a = ap.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
+    if a.cmd == "run":
+        a.extra = list(a.extra or []) + rest
     cfg = load_config(a.config)
     a.work.mkdir(parents=True, exist_ok=True)
     if a.cmd == "fetch":
