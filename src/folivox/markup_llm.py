@@ -55,6 +55,20 @@ class CostCapReached(LLMError):
     """The next model call would pass the run's spending cap; what is done is saved and the run can be resumed."""
 
 
+class ShortReply(ValueError):
+    """A usable reply that leaves out paragraphs with speech (a model that answers the first paragraphs and stops).
+    It is asked again like any bad reply; when every try stays short, the most complete one is kept."""
+
+    def __init__(self, reply: dict, missing: list[int]):
+        super().__init__(f"the reply left out {len(missing)} paragraph(s) with speech")
+        self.reply, self.missing = reply, missing
+
+    def retry_note(self) -> str:
+        shown = ", ".join(f"B{b}" for b in self.missing[:12]) + (", …" if len(self.missing) > 12 else "")
+        return (f"\n\nYour previous answer left out paragraphs that contain speech ({shown}). Answer for every "
+                "paragraph, with the JSON object only.")
+
+
 # -- character bible ------------------------------------------------------------------------------------------
 
 def norm_name(s: str) -> str:
@@ -417,9 +431,11 @@ class Runner:
             except ValueError:
                 pass
         last: Exception | None = None
+        best: ShortReply | None = None  # the most complete of the short replies, never cached
         for attempt in range(self.tries):
             self.calls += 1
-            extra = "" if attempt == 0 else "\n\nYour previous answer was not valid. Answer with the JSON object only."
+            extra = ("" if attempt == 0 else last.retry_note() if isinstance(last, ShortReply)
+                     else "\n\nYour previous answer was not valid. Answer with the JSON object only.")
             sent = len(system) + len(prompt) + len(extra)
             if self.budget is not None:
                 self.budget.check(sent)  # raises CostCapReached before a call that would pass the cap
@@ -441,12 +457,18 @@ class Runner:
                 self.budget.record(getattr(self.llm, "last_usage", None), sent, len(reply))
             try:
                 out = validate(extract_json(reply))
+            except ShortReply as e:
+                last = e
+                best = e if best is None or len(e.missing) < len(best.missing) else best
+                continue
             except (ValueError, KeyError, TypeError, AttributeError) as e:
                 last = e
                 continue
             self.cache.put(key, reply)
             return out
         self.failures += 1
+        if best is not None:
+            raise best
         raise ValueError(f"no usable answer after {self.tries} tries: {last}")
 
 
@@ -1047,6 +1069,8 @@ class AnnotateStats:
     unknown_speakers: int = 0
     dropped_tags: int = 0
     failed_windows: int = 0
+    short_windows: int = 0  # windows whose every reply left out paragraphs with speech (the most complete is kept)
+    skipped: int = 0  # paragraphs with speech the model left out: the narrator reads them, they are on the review list
     new_characters: int = 0
     flagged: int = 0  # paragraphs sent to the review list
 
@@ -1216,14 +1240,30 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
                 speakers=_speakers_json(bible, relevant), recent=recent, text=text,
                 expression=EXPRESSION_RULES.format(tags=tag_list) if expression_tags else "")
         originals = dict(w.blocks)
+        must = [b for b, t in w.blocks if DIALOGUE_START.search(t)]  # paragraphs that open with speech
 
-        def check(d: dict) -> dict:
+        def check(d: dict, must=must) -> dict:
             if not isinstance(d.get("blocks"), list):
                 raise ValueError("no blocks list")
+            answered = set()
+            for item in d["blocks"]:
+                try:
+                    answered.add(int(str(item["b"]).lstrip("B")))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            missing = [b for b in must if b not in answered]
+            if missing:
+                raise ShortReply(d, missing)
             return d
 
         try:
             out = runner.ask(PARTS_SYSTEM if by_parts else ANNOTATE_SYSTEM, prompt, check)
+        except ShortReply as e:  # asked again and still short: keep what it answered, the rest goes on the list
+            out = e.reply
+            stats.short_windows += 1
+            if progress:
+                progress("annotate", n + 1, len(wins),
+                         f"window {n + 1}: the model left out {len(e.missing)} paragraph(s) with speech")
         except ValueError:
             stats.failed_windows += 1
             stats.blocks += len(w.blocks)
@@ -1304,6 +1344,7 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
             if b in missing and DIALOGUE_START.search(t):
                 cm.review = [r for r in cm.review if r.get("b") != b] + [{"b": b, "code": "skipped"}]
                 stats.flagged += 1
+                stats.skipped += 1
         if last_window[w.chapter] == n and not sampled:
             cm.done = True  # every window of this chapter has been through the model
         cm.spans.sort(key=lambda s: (s.block, s.start))
