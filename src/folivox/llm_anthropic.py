@@ -77,14 +77,18 @@ class AnthropicLLM(LLM):
         """One request; the SDK retries 429, 5xx and dropped connections itself. What is left is mapped onto the
         markup's rules: busy (ConnectionError: wait and try again), a bad request (ValueError: an unusable answer)
         or a setup problem (LLMError: stop and say what to fix)."""
+        if self.model in FALLBACK_MODELS:  # "default": the API picks the fallback model by the refusal's kind
+            return self._call(lambda: self.client.beta.messages.create(**req, betas=[FALLBACK_BETA],
+                                                                        fallbacks="default"))
+        return self._call(lambda: self.client.messages.create(**req))
+
+    def _call(self, fn):
         import anthropic
 
         from folivox.markup_llm import LLMError
 
         try:
-            if self.model in FALLBACK_MODELS:  # "default": the API picks the fallback model by the refusal's kind
-                return self.client.beta.messages.create(**req, betas=[FALLBACK_BETA], fallbacks="default")
-            return self.client.messages.create(**req)
+            return fn()
         except anthropic.AuthenticationError:
             raise LLMError("Anthropic refused the API key (HTTP 401): check ANTHROPIC_API_KEY.") from None
         except anthropic.PermissionDeniedError as e:
@@ -116,6 +120,35 @@ class AnthropicLLM(LLM):
         if msg.stop_reason == "max_tokens":
             raise ValueError("the answer was cut off at the token limit")
         return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+
+    # -- Message Batches: the marking pass in rounds at half price (folivox.markup_llm.Runner.ask_batch) -------------
+    batches = True
+
+    def batch_submit(self, items: list[tuple[str, str, str | None]]) -> str:
+        """One Message Batch of ``(custom id, prompt, system)``, built as single requests are (cache breakpoints,
+        thinking, effort); a batch takes no server-side fallbacks, so a refusal there is retried on its own. Returns
+        the batch id."""
+        reqs = [{"custom_id": cid, "params": self._request(prompt, system, None)} for cid, prompt, system in items]
+        return self._call(lambda: self.client.messages.batches.create(requests=reqs)).id
+
+    def batch_status(self, batch_id: str) -> str:
+        """``in_progress``, ``canceling`` or ``ended``."""
+        return str(self._call(lambda: self.client.messages.batches.retrieve(batch_id)).processing_status)
+
+    def batch_results(self, batch_id: str) -> dict:
+        """``{custom id: (reply text or the ValueError it ended with, usage or None)}`` of an ended batch; results
+        come in any order. Errored, canceled and expired requests were not billed."""
+        out = {}
+        for r in self._call(lambda: list(self.client.messages.batches.results(batch_id))):
+            kind = r.result.type
+            if kind == "succeeded":
+                try:
+                    out[r.custom_id] = (self._read(r.result.message), self.last_usage)
+                except ValueError as e:  # a refusal or an answer cut off: billed all the same
+                    out[r.custom_id] = (e, self.last_usage)
+            else:
+                out[r.custom_id] = (ValueError(f"the batch request {kind}"), None)
+        return out
 
     def complete(self, prompt, system=None, temperature=0.3):
         # no temperature: current Claude models accept only the default

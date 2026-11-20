@@ -21,6 +21,7 @@ THINKING_LIKELY, THINKING_MAX = 2.0, 4.5
 FIRST_OUTPUT_SHARE = 0.8  # before the first reply of a run: output tokens per prompt token (measured 0.3 to 0.8)
 KNOWN_GUESS = 8  # characters in the list sent with each window when the book has not been analysed yet
 SHORT_CALL = 0.25  # a second-look call (one character, one paragraph) is about a quarter of a marking call
+BATCH_PRICE = 0.5  # Message Batches bill every token at half the price
 
 PRICES_READ = "2026-11-20"
 # List prices, USD per million tokens: input, output, cached input read, cache write. Read on PRICES_READ from the
@@ -175,12 +176,15 @@ class Budget:
             raise ValueError("The spending cap must be more than zero")
         self.price, self.max_cost, self.hint = price, max_cost, hint
         self.spent = Usage()
+        self.batched = Usage()  # the part of spent that went through Message Batches (half price)
         self.chars = 0  # prompt characters of the calls whose usage was reported
         self.longest = 0  # output tokens of the longest reply so far
 
     @property
     def usd(self) -> float | None:
-        return self.price.usd(self.spent) if self.price else None
+        if not self.price:
+            return None
+        return self.price.usd(self.spent) - (1 - BATCH_PRICE) * self.price.usd(self.batched)
 
     def _next(self, chars: int) -> Usage:
         """A guess of the next call: its prompt at this run's tokens per character and a reply as long as the longest
@@ -190,12 +194,13 @@ class Budget:
         out = self.longest if self.spent.calls else math.ceil(prompt * FIRST_OUTPUT_SHARE)
         return Usage(1, prompt, out)
 
-    def check(self, chars: int) -> None:
-        """Raise :class:`~folivox.markup_llm.CostCapReached` when sending ``chars`` characters would pass the cap."""
+    def check(self, chars: int, calls: int = 1, batch: bool = False) -> None:
+        """Raise :class:`~folivox.markup_llm.CostCapReached` when sending ``chars`` characters (in ``calls`` calls,
+        at the batch price when ``batch``) would pass the cap."""
         if self.max_cost is None or self.price is None:
             return
-        nxt = self._next(chars)
-        after = self.price.usd(self.spent) + self.price.usd(nxt)
+        nxt = self._next(math.ceil(chars / max(calls, 1)))
+        after = (self.usd or 0) + self.price.usd(nxt) * calls * (BATCH_PRICE if batch else 1)
         if after > self.max_cost:
             from folivox.markup_llm import CostCapReached
 
@@ -203,8 +208,9 @@ class Budget:
                                  f"{self.spent.tokens:,} tokens in {self.spent.calls} calls). Progress is saved: "
                                  f"{self.hint}.")
 
-    def record(self, usage: dict | None, chars: int, reply_chars: int) -> None:
-        """Count one reply: the usage it reported, or (when the server said nothing) its size in characters."""
+    def record(self, usage: dict | None, chars: int, reply_chars: int, batch: bool = False) -> None:
+        """Count one reply: the usage it reported, or (when the server said nothing) its size in characters; a reply
+        from a Message Batch at half the price."""
         if not usage:
             usage = {"input": math.ceil(chars / CHARS_PER_TOKEN),
                      "output": math.ceil(reply_chars / CHARS_PER_TOKEN * THINKING_LIKELY)}
@@ -212,6 +218,8 @@ class Budget:
         else:
             self.chars += chars
         self.spent.add(usage)
+        if batch:
+            self.batched.add(usage)
         self.longest = max(self.longest, int(usage.get("output") or 0))
 
     def summary(self) -> str:
@@ -221,6 +229,8 @@ class Budget:
         cached = f", {u.cache_read:,} of them read from the provider's cache" if u.cache_read else ""
         rough = f" ({u.estimated} replies reported no usage and were counted by size)" if u.estimated else ""
         cost = f"≈ ${self.usd:.2f}" if self.usd is not None else "price not known"
+        if self.batched.calls:
+            cost += f" ({self.batched.calls} of the calls through Message Batches at half price)"
         return (f"Spent {cost}: {u.prompt:,} prompt tokens{cached} and {u.output:,} output tokens in {u.calls} "
                 f"calls{rough}.")
 
@@ -239,6 +249,15 @@ class Estimate:
     model: str = ""
     provider: str = ""
     notes: list[str] = field(default_factory=list)
+    batch: bool = False  # the marking calls go through Message Batches (half price)
+    mark_input_tokens: int = 0  # the marking calls' share of the tokens, for the batch price
+    mark_output_tokens: int = 0
+    mark_output_tokens_max: int = 0
+
+    def _discount(self, out: int) -> float:
+        if not (self.batch and self.price):
+            return 0.0
+        return (1 - BATCH_PRICE) * self.price.usd(Usage(input=self.mark_input_tokens, output=out))
 
     @property
     def calls(self) -> int:
@@ -246,11 +265,17 @@ class Estimate:
 
     @property
     def usd(self) -> float | None:
-        return self.price.usd(Usage(input=self.input_tokens, output=self.output_tokens)) if self.price else None
+        if not self.price:
+            return None
+        return self.price.usd(Usage(input=self.input_tokens, output=self.output_tokens)) - self._discount(
+            self.mark_output_tokens)
 
     @property
     def usd_max(self) -> float | None:
-        return self.price.usd(Usage(input=self.input_tokens, output=self.output_tokens_max)) if self.price else None
+        if not self.price:
+            return None
+        return self.price.usd(Usage(input=self.input_tokens, output=self.output_tokens_max)) - self._discount(
+            self.mark_output_tokens_max)
 
     def to_dict(self) -> dict:
         return {"provider": self.provider, "model": self.model, "calls": self.calls,
@@ -260,7 +285,8 @@ class Estimate:
                 "free": bool(self.price and self.price.free), "price_known": self.price is not None,
                 "price_source": self.price.source if self.price else "",
                 "usd": None if self.usd is None else round(self.usd, 4),
-                "usd_max": None if self.usd_max is None else round(self.usd_max, 4), "approximate": True}
+                "usd_max": None if self.usd_max is None else round(self.usd_max, 4), "approximate": True,
+                "batch": self.batch}
 
 
 def _stand_ins(bible):
@@ -316,14 +342,14 @@ def _parts_reply(blocks: list[tuple[int, str]]) -> int:
 
 def estimate(chapters: list, lang: str, bible, price: Price | None, *, analyse: list | None = None,
              annotate: list | None = None, extra_calls: int = 0, expression_tags: bool = False,
-             method: str | None = None, model: str = "", provider: str = "") -> Estimate:
+             method: str | None = None, model: str = "", provider: str = "", batch: bool = False) -> Estimate:
     """Tokens and USD of a run that sends the ``analyse`` and ``annotate`` windows (from :func:`analyse_windows` /
     :func:`annotate_windows`) and ``extra_calls`` short second-look calls, built as the passes build them."""
     import os
 
     from folivox import markup_llm as ml
 
-    est = Estimate(price=price, model=model, provider=provider)
+    est = Estimate(price=price, model=model, provider=provider, batch=batch)
     sized = _stand_ins(bible)
     person = bible.narration or "third"
     in_chars = reply_chars = 0
@@ -372,6 +398,9 @@ def estimate(chapters: list, lang: str, bible, price: Price | None, *, analyse: 
     reply_tokens = reply_chars / CHARS_PER_TOKEN
     est.output_tokens = math.ceil(reply_tokens * THINKING_LIKELY)
     est.output_tokens_max = math.ceil(reply_tokens * THINKING_MAX)
+    est.mark_input_tokens = math.ceil(mark_in / CHARS_PER_TOKEN)
+    est.mark_output_tokens = math.ceil(mark_reply / CHARS_PER_TOKEN * THINKING_LIKELY)
+    est.mark_output_tokens_max = math.ceil(mark_reply / CHARS_PER_TOKEN * THINKING_MAX)
     return est
 
 
@@ -388,4 +417,5 @@ def describe(e: Estimate) -> str:
                 f"shown: set price_in and price_out (USD per million tokens) in [llm.{e.provider or '<provider>'}] in "
                 "config.toml.")
     src = "your config prices" if e.price.source == "config" else f"approximate list prices read {PRICES_READ}"
-    return f"{calls}, {tokens}: ≈ ${e.usd:.2f} (up to ${e.usd_max:.2f}). {src[0].upper() + src[1:]}."
+    batch = " The marking calls go through Message Batches, at half price." if e.batch else ""
+    return f"{calls}, {tokens}: ≈ ${e.usd:.2f} (up to ${e.usd_max:.2f}). {src[0].upper() + src[1:]}.{batch}"
