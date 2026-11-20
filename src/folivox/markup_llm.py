@@ -422,16 +422,19 @@ class Runner:
                               waiting)
         if replies is None:
             return None
-        for i in todo:
-            system, prompt, validate, *schema = items[i]
+        again = []
+        for i in todo:  # every usable answer is kept before any is asked again (a retry can stop at the cap)
             reply = replies.get(keys[i])
             if isinstance(reply, str):
                 try:
-                    out[i] = validate(extract_json(reply))
+                    out[i] = items[i][2](extract_json(reply))
                     self.cache.put(keys[i], reply)
                     continue
                 except (ValueError, KeyError, TypeError, AttributeError):
                     pass
+            again.append(i)
+        for i in again:
+            system, prompt, validate, *schema = items[i]
             try:  # one at a time, with the usual retries
                 out[i] = self.ask(system, prompt, validate, schema=schema[0] if schema else None)
             except ValueError as e:

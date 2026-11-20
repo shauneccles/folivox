@@ -234,3 +234,28 @@ def test_the_estimate_prices_the_reading_calls_at_half_with_batch_reading():
     half = mc.estimate(chapters, "ru", bible, price, analyse=read, annotate=mark, batch=True, batch_reading=True)
     assert half.usd == pytest.approx(full.usd / 2) and half.usd_max == pytest.approx(full.usd_max / 2)
     assert "reading and marking calls go through Message Batches" in mc.describe(half)
+
+
+class CapOnRealtime:
+    """A spending cap that a batch round fits under and a call on its own does not."""
+
+    def check(self, chars, calls=1, batch=False):
+        if not batch:
+            raise ml.CostCapReached("the cap")
+
+    def record(self, *args, **kwargs):
+        pass
+
+
+def test_a_retry_that_hits_the_cap_loses_no_paid_batch_answer(tmp_path):
+    c = client(fail={("msgbatch_0", 0): "errored"})
+    llm = AnthropicLLM(model="claude-haiku-5-5", client=c)
+    cache = ml.Cache(tmp_path / "c.sqlite")
+    runner = ml.Runner(llm, llm.model, cache, budget=CapOnRealtime(), sleep=lambda s: None)
+    items = [(ml.ANALYSE_SYSTEM, f"Excerpt:\n[B{n}] — Да, — сказала Анна. ({n})", ml._check_analysis) for n in range(2)]
+    with pytest.raises(ml.CostCapReached):
+        runner.ask_batch(items)
+    assert cache.get(runner.key(*items[1][:2])) is not None  # the second answer, paid for, is kept
+    out = ml.Runner(llm, llm.model, cache, sleep=lambda s: None).ask_batch(items)
+    assert all(isinstance(o, dict) for o in out)
+    assert len(c.messages.batches.created) == 2 and len(c.messages.batches.created[1]) == 1  # only the first again
