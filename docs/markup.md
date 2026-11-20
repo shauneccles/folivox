@@ -130,10 +130,22 @@ folivox markup auto book.epub                # mark the speakers (--chapters 1-3
 
 **Models.** Gemma 4 is multilingual and comes in sizes for different memory; Folivox proposes the largest that
 fits (`gemma4:31b-it-qat` from 48 GB, `26b-a4b-it-qat` from 32 GB, `12b-it-qat` for everything smaller) and
-you can use any other Ollama model, or an OpenAI-compatible API (`--llm openai --model NAME`, your key, the text
-goes to that service). Set a default in `config.toml`: `[llm.ollama] model = "gemma4:12b-it-qat"`. The analysis
+you can use any other Ollama model, an OpenAI-compatible API (`--llm openai --model NAME`), or Claude through
+Anthropic's own API (`--llm anthropic`, below); with an API it is your key and the text goes to that service. Set a default in `config.toml`: `[llm.ollama] model = "gemma4:12b-it-qat"`. The analysis
 runs before the audio is made, never together with the voice model. Small models miss subtle speakers: check
 the result.
+
+**Cost with a paid API.** A local model is free. With an API, `folivox markup auto BOOK --estimate` (or
+`analyse --estimate`) shows the calls, tokens and approximate USD of the run and sends nothing; the studio shows the
+same next to the time of each button. The estimate builds the prompts this book would send and sizes the answers
+from its paragraphs with speech; models also reason before they answer, so it gives a likely figure and an "up to"
+one. Well-known models have list prices built in (`folivox/markup_cost.py`, with the date they were read); set
+`price_in` and `price_out` (USD per million tokens) in `[llm.openai]` for any other model, or the estimate shows
+tokens and says the price is not known. `--max-cost N` (the studio's *Spending cap, $* under Options) counts the
+tokens each reply reports and stops cleanly before the call that would pass N USD (each call is judged by its prompt
+and the longest reply so far); the replies already paid for are saved, so the same command with a higher cap
+carries on. There is no cap unless you set one, and a cap needs a
+known price.
 
 A small test on an Apple-silicon Mac with 36 GB (made-up texts of 20 paragraphs, 15 with speech, the same story in
 English, Russian, German and Spanish; counted: paragraphs whose quoted speech went to the right character):
@@ -160,6 +172,33 @@ times faster, but unstable. `e2b` worked only on English (10/15) and returned un
 and Spanish (0/15); `e4b` handled all four languages (9-12/15) but the same English text gave 0/15 once and
 12/15 on the next run, and an unreliable result is worse than a slow one. A speaker tag with a missing bar
 (`<|speaker:1>`) is understood, and a paragraph that starts with a dialogue dash with no space after it (Spanish «—¿Vas?») counts as speech.
+
+**Claude through Anthropic's API** (`--llm anthropic`, `pip install 'folivox[anthropic]'`, key in
+`ANTHROPIC_API_KEY`, its `_FILE` form or the studio's keychain; `[llm.anthropic] model` and `effort` in
+`config.toml`, default `claude-opus-5-5`). The prompts are the same as for any other model, in another order: the
+instructions first, then (when marking) every speaker by id, then the context and the paragraphs. The first two are
+marked for Anthropic's prompt cache, so each later window of a pass reads them at a tenth of the input price or
+less. Measured on 33,000 characters of *Pride and Prejudice* (14 calls): a third of the prompt tokens came from the
+cache and the input cost fell by 31%, about $0.42 per 500,000-character book with Claude Sonnet 5.5 and $0.84 with
+Claude Opus 5.5 (the answers, which are most of the bill, cost the same). The character list sent while *reading* the
+book changes from almost every window to the next, so only the instructions are cached there. The analysis and the
+second look get structured outputs (the JSON shape is enforced); a refusal, or an answer cut off at the token limit,
+counts as an unusable answer (the narrator reads that window); on Claude Opus 5.5 and Sonnet 5.5 a refusal is first
+handed to Anthropic's fallback model on the server.
+
+**Batch mode** (`markup auto BOOK --llm anthropic --batch`, prototype). The marking pass goes through Anthropic's
+Message Batches, which bill every token at half price but answer in minutes, not seconds. The windows are cut into
+`--batch-strands` strands of consecutive windows (default 20); each round sends the next window of every strand in
+one batch and takes the answers in order, exactly as the one-at-a-time run does, so a character found in one strand
+is known to the next round of all of them. Each strand keeps its own context (the speakers of its previous
+window); a strand that starts mid-book is shown the paragraphs before it, without speakers. `--batch-strands 1`
+asks exactly what a run without `--batch` asks. `--batch-reading N` reads the book through batches too: the windows
+are cut into N strands (fewer and longer than for marking, as each strand builds its own character list as it
+goes), and once every strand is read their lists are merged, a character found under one of its names in another
+list counting as the same person (the consolidate pass of `--best` then joins the names that are one person).
+Replies go to the same cache, a batch still running when a run is stopped is collected by the next run, an errored
+or expired request is asked again on its own, and `--estimate` and `--max-cost` count the batched calls at the batch
+price.
 
 **Memory of the book ("bible").** `analyse` goes through the book in windows of about 5000 characters. For each
 window the model gets the characters found so far (name, nicknames, gender, age and manner of speech of those named
