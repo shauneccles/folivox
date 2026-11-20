@@ -634,3 +634,51 @@ def test_a_preview_reads_a_sample_and_a_full_run_starts_over():
     assert not b.sampled and b.done_windows == b.total_windows >= 2
     markup, _ = ml.annotate(CH, "ru", b, runner, max_windows=1)
     assert not any(c.done for c in markup.chapters.values())  # a sample does not mark a chapter as processed
+
+
+class NarrationLLM(LLM):
+    """Answers a window as a careful model would: speech to its speaker, a "thought" in narration to nobody (every part
+    to the narrator), and leaves one paragraph out."""
+
+    name = "fake"
+
+    def complete(self, prompt, system=None, temperature=0.3):
+        return self.complete_json(prompt, system, temperature)
+
+    def complete_json(self, prompt, system=None, temperature=0.2):
+        blocks = []
+        for m in re.finditer(r"\[B(\d+)\]\n((?:  \d+\| .*\n?)+)", prompt):
+            text = m.group(2)
+            if "Come in" in text:
+                blocks.append({"b": int(m.group(1)), "who": {"1": 1}})
+            elif "thought no more" in text:
+                blocks.append({"b": int(m.group(1)), "who": {}})
+        return json.dumps({"blocks": blocks, "new_characters": [], "updates": []})
+
+
+NARRATION = [Chapter("One", [Block(BlockKind.PARAGRAPH, t) for t in (
+    '"Come in," said Ann.', "Ann thought no more of the matter.", '"Not now," said Ben.')])]
+
+
+def test_a_paragraph_answered_as_narration_is_not_counted_as_a_miss():
+    bible = ml.Bible("en", characters=[ml.Character("Ann", gender="f", lines=2, id=1),
+                                       ml.Character("Ben", gender="m", lines=1, id=2)])
+    markup, stats = ml.annotate(NARRATION, "en", bible, ml.Runner(NarrationLLM(), "m", ml.Cache(None)))
+    assert (stats.blocks, stats.marked, stats.narrated, stats.unanswered, stats.fell_back) == (3, 1, 1, 1, 0)
+
+
+def test_cli_summary_tells_narration_from_misses(tmp_path, monkeypatch):
+    from folivox import cli_markup
+    from folivox.cli import app
+
+    book = tmp_path / "b.txt"
+    book.write_text("One\n\n" + "\n\n".join(b.text for b in NARRATION[0].blocks) + "\n", encoding="utf-8")
+    bible = ml.Bible("en", characters=[ml.Character("Ann", gender="f", lines=2, id=1),
+                                       ml.Character("Ben", gender="m", lines=1, id=2)], done_windows=1, total_windows=1)
+    bible.save(ml.bible_path(book))
+    monkeypatch.setattr(cli_markup, "_llm", lambda provider, model: (NarrationLLM(), "fake-model"))
+    res = CliRunner().invoke(app, ["markup", "auto", str(book)])
+    assert res.exit_code == 0, res.output
+    out = " ".join(res.output.split())
+    assert "3 paragraphs that may hold speech: 1 marked, 1 answered as narration (no one speaks in them)" in out
+    assert "1 left out of the answers and 0 failed" in out
