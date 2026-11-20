@@ -483,10 +483,19 @@ def _report_spend(engine, events: Events, opts: RenderOptions) -> None:
 
 
 def synthesize_pending(journal: Journal, engine, voice, asr, opts: RenderOptions, events: Events,
-                       voices: dict | None = None) -> None:
+                       voices: dict | None = None, chapter_done=None) -> None:
+    """``chapter_done(index)`` is called for each chapter whose fragments are all done: first for those done
+    already, then for each as its last fragment is kept (after its QA and retakes)."""
     from folivox.tts.base import Prefetcher
 
     pending = journal.pending()
+    waiting: dict[int, set[str]] = {}
+    for c in pending:
+        waiting.setdefault(c.chapter, set()).add(c.key)
+    if chapter_done is not None:
+        for ci, _ in journal.chapters():
+            if ci not in waiting:
+                chapter_done(ci)
     st = journal.stats()
     events.plan(st["total_chars"], st["done_chars"], len(journal.chunks()), len(pending))
     pending_keys = {c.key for c in pending}
@@ -532,6 +541,12 @@ def synthesize_pending(journal: Journal, engine, voice, asr, opts: RenderOptions
             clock = now
             journal.record(take)
             events.chunk_done(chunk, take, attempts)
+            for ci in sorted(waiting):
+                waiting[ci].discard(chunk.key)
+                if not waiting[ci]:
+                    del waiting[ci]
+                    if chapter_done is not None:
+                        chapter_done(ci)
             _report_spend(engine, events, opts)
     except CapHit as e:
         raise CostCapReached(str(e)) from None
@@ -646,40 +661,62 @@ def load_engine(opts: RenderOptions, events: Events):
                        "models folder (see `folivox doctor`) and run again; they are downloaded once more") from last
 
 
-def assemble(journal: Journal, book: Book, opts: RenderOptions, sample_rate: int, events: Events) -> Path:
-    work = journal.dir
-    built: list[ChapterAudio] = []
-    for ci, title in journal.chapters():
-        chunks = journal.chunks(ci)
-        if not chunks or not all(journal.is_done(c.key) for c in chunks):
-            events.warning(f"Chapter “{title}” is not fully rendered — skipping")
-            continue
-        sig = hashlib.sha1("|".join(f"{c.key}:{c.pause}" for c in chunks).encode()).hexdigest()
-        path = work / "chapters" / f"{ci + 1:03d}.flac"
-        if journal.meta(f"chapter_sig_{ci}") == sig and _chapter_ok(path, journal.meta(f"chapter_dur_{ci}")):
-            dur = journal.meta(f"chapter_dur_{ci}")
-        else:
-            events.stage("chapter", f"Building chapter {ci + 1}: {title}")
-            dur = build_chapter([(journal.audio_path(c.key), c.pause) for c in chunks], path, sample_rate)
-            journal.set_meta(**{f"chapter_sig_{ci}": sig, f"chapter_dur_{ci}": dur})
-        # chapter marks follow the file as written (older journals stored the pre-loudnorm length)
-        dur = _measured(path, dur)
-        built.append(ChapterAudio(title, path, dur))
-        events.chapter_built(ci, title, dur)
-    if not built:
-        raise RuntimeError("Nothing to assemble: no chapter is fully rendered")
+def chapter_audio(journal: Journal, ci: int, title: str, sample_rate: int,
+                  events: Events) -> tuple[ChapterAudio, str] | None:
+    """Chapter ``ci`` built from its takes (reused when they have not changed) and its signature; None when it is
+    not fully rendered."""
+    chunks = journal.chunks(ci)
+    if not chunks or not all(journal.is_done(c.key) for c in chunks):
+        return None
+    sig = hashlib.sha1("|".join(f"{c.key}:{c.pause}" for c in chunks).encode()).hexdigest()
+    path = journal.dir / "chapters" / f"{ci + 1:03d}.flac"
+    if journal.meta(f"chapter_sig_{ci}") == sig and _chapter_ok(path, journal.meta(f"chapter_dur_{ci}")):
+        dur = journal.meta(f"chapter_dur_{ci}")
+    else:
+        events.stage("chapter", f"Building chapter {ci + 1}: {title}")
+        dur = build_chapter([(journal.audio_path(c.key), c.pause) for c in chunks], path, sample_rate)
+        journal.set_meta(**{f"chapter_sig_{ci}": sig, f"chapter_dur_{ci}": dur})
+    # chapter marks follow the file as written (older journals stored the pre-loudnorm length)
+    return ChapterAudio(title, path, _measured(path, dur)), sig
+
+
+def book_meta(book: Book, opts: RenderOptions) -> BookMeta:
     m = opts.meta
-    meta = BookMeta(m.get("title") or book.title, m.get("author") or book.author, m.get("year") or book.year,
+    return BookMeta(m.get("title") or book.title, m.get("author") or book.author, m.get("year") or book.year,
                     attributed(m.get("description") or book.annotation, opts.tts), m.get("narrator") or opts.narrator,
                     m.get("series", ""), m.get("series_part", ""), m.get("genre", ""))
-    cover = None if opts.no_cover else (opts.cover.read_bytes() if opts.cover else book.cover)
+
+
+def book_cover(book: Book, opts: RenderOptions) -> bytes | None:
+    return None if opts.no_cover else (opts.cover.read_bytes() if opts.cover else book.cover)
+
+
+def assemble(journal: Journal, book: Book, opts: RenderOptions, sample_rate: int, events: Events,
+             outbox=None) -> Path:
+    built: list[ChapterAudio] = []
+    published: set[int] = set()
+    for ci, title in journal.chapters():
+        chapter = chapter_audio(journal, ci, title, sample_rate, events)
+        if chapter is None:
+            events.warning(f"Chapter “{title}” is not fully rendered — skipping")
+            continue
+        built.append(chapter[0])
+        events.chapter_built(ci, title, chapter[0].duration)
+        published.add(ci)
+        if outbox is not None:
+            outbox.publish(ci, *chapter)
+    if not built:
+        raise RuntimeError("Nothing to assemble: no chapter is fully rendered")
+    meta, cover = book_meta(book, opts), book_cover(book, opts)
     events.stage("encode", "Encoding {fmt}".format(fmt="MP3" if opts.mp3 else "M4B"))
     if opts.mp3:
         out_dir = opts.output if opts.output.suffix == "" else opts.output.with_suffix("")
         write_mp3s(built, out_dir, meta, cover)
-        return out_dir
-    write_m4b(built, opts.output, meta, cover, opts.bitrate)
-    return opts.output
+    else:
+        write_m4b(built, opts.output, meta, cover, opts.bitrate)
+    if outbox is not None:  # only once the whole book is written beside it
+        outbox.finish(published)
+    return out_dir if opts.mp3 else opts.output
 
 
 def _engine_options(opts: RenderOptions) -> dict:
@@ -914,6 +951,9 @@ def render(book: Book, opts: RenderOptions, events: Events | None = None) -> Pat
 
                         raise ProviderError(f"Speaker {sid}: " + fish_check.BUNDLED_VOICES_NOTE)
         plan(book, opts, journal, voice.id, events, engine, markup, voices)
+        from folivox.outbox import Outbox
+
+        outbox = Outbox.open(journal, opts, lambda: (book_meta(book, opts), book_cover(book, opts)), events)  # None: unset
         if not cloud:
             for note in voice_accent_notes(journal, markup, opts):
                 events.warning(note)
@@ -939,11 +979,18 @@ def render(book: Book, opts: RenderOptions, events: Events | None = None) -> Pat
                 events.stage("model", f"Model loaded in {time.time() - t0:.0f} s ({engine.device})")
                 sample_rate = engine.sample_rate
             events.stage("device", f"Device: {device_label(engine)}")
-            synthesize_pending(journal, engine, voice, asr, opts, events, voices)
+
+            def chapter_done(ci: int) -> None:  # written as soon as it is finished
+                chapter = chapter_audio(journal, ci, dict(journal.chapters())[ci], sample_rate, events)
+                if chapter is not None:  # a chapter with no fragments makes no audio
+                    outbox.publish(ci, *chapter)
+
+            synthesize_pending(journal, engine, voice, asr, opts, events, voices,
+                               chapter_done if outbox is not None else None)
         else:
             sample_rate = _cached_sample_rate(journal) or journal.meta("sample_rate", 24000)
         journal.set_meta(sample_rate=sample_rate)
-        result = assemble(journal, book, opts, sample_rate, events)
+        result = assemble(journal, book, opts, sample_rate, events, outbox)
         if cloud and owned and not opts.keep_voice:
             engine.release(voice)  # only after a finished run: an interrupted one resumes with the same voice
             journal.set_meta(cloud_voice="", cloud_voice_for="")
