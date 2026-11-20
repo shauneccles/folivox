@@ -363,9 +363,11 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
     mk.stamp(markup, chs)
     markup.save(mp)
     bible.save(bp)
-    console.print(f"Saved {mp}: {stats.marked} of {stats.blocks} paragraphs with speech marked; "
-                  f"{stats.fell_back} read by the narrator because the answer changed the text or failed; "
-                  f"{stats.unknown_speakers} unknown speakers and {stats.dropped_tags} unknown tags dropped.")
+    console.print(f"Saved {mp}: {stats.blocks} paragraphs that may hold speech: {stats.marked} marked, "
+                  f"{stats.narrated} answered as narration (no one speaks in them); "
+                  f"{stats.unanswered} left out of the answers and {stats.fell_back} failed (the answer changed the "
+                  f"text or the call failed): the narrator reads them; {stats.unknown_speakers} unknown speakers and "
+                  f"{stats.dropped_tags} unknown tags dropped.")
     console.print("Check and fix it with `folivox markup export` / `import`, assign voices with "
                   "`folivox markup speaker`.")
 
