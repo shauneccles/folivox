@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "zbývá {t}",
  "mk.cost": "≈ ${usd}, až ${max}",
+ "mk.batch": "Dávkově (poloviční cena, pomaleji)",
  "mk.cost.unknown": "{n} tokenů, cena neznámá",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

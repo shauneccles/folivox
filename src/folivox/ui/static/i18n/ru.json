@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "осталось {t}",
  "mk.cost": "≈ ${usd}, до ${max}",
+ "mk.batch": "Пакетно (вдвое дешевле, дольше)",
  "mk.cost.unknown": "{n} токенов, цена неизвестна",
  "mk.dur.under": "< 1 мин",
  "mk.dur.min": "{n} мин",

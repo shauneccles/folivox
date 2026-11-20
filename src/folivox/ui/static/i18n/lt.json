@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "liko {t}",
  "mk.cost": "≈ ${usd}, iki ${max}",
+ "mk.batch": "Paketais (perpus pigiau, lėčiau)",
  "mk.cost.unknown": "{n} žetonų, kaina nežinoma",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

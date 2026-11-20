@@ -186,6 +186,24 @@ second look get structured outputs (the JSON shape is enforced); a refusal, or a
 counts as an unusable answer (the narrator reads that window); on Claude Opus 5.5 and Sonnet 5.5 a refusal is first
 handed to Anthropic's fallback model on the server.
 
+**Batch mode** (`markup auto BOOK --llm anthropic --batch`, or the studio's "Batch" box). Both passes go through
+Anthropic's Message Batches, which bill every token at half price but answer in minutes, not seconds: a round takes
+about five minutes, whatever its size.
+
+- Reading: the windows are cut into `--batch-reading` strands of consecutive windows (default 8; 0 reads one call at a
+  time). Each round sends the next window of every strand in one batch, and each strand builds its own character list
+  as it goes. Once every strand is read the lists are merged: a character found by its name, or by an alias unless
+  the two full names differ (Robert Cohn, Robert Prentiss), counts as the same person. The model is then asked once
+  which names are one person, as the consolidate pass asks.
+- Marking: the windows are cut into `--batch-strands` strands (default 20) and the answers are taken in order, exactly
+  as the one-at-a-time run does, so a character found in one strand is known to the next round of all of them. Each
+  strand keeps its own context; a strand that starts mid-book is shown the paragraphs before it, without speakers.
+  `--batch-strands 1` asks exactly what a run without `--batch` asks.
+
+Replies go to the same cache, a batch still running when a run is stopped is collected by the next run, an errored,
+expired or short answer is asked again on its own, and `--estimate` and `--max-cost` count the batched calls at the
+batch price.
+
 **Memory of the book ("bible").** `analyse` goes through the book in windows of about 5000 characters. For each
 window the model gets the characters found so far (name, nicknames, gender, age and manner of speech of those named
 in the window, active in the last windows or the busiest) and reports who speaks, thinks or matters. What it says

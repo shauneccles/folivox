@@ -57,3 +57,37 @@ def test_the_spending_cap_is_checked_and_stops_a_run_cleanly(client):
     r = client.post(f"/api/books/{bid}/llm/start", json={"task": "auto", "model": "some/new-model", "max_cost": 50})
     st = wait(client, bid)
     assert st["state"] == "done" and st["reason"] == "" and st["spent"]["usd"] <= 50
+
+
+def test_batch_mode_is_offered_priced_and_run_for_a_provider_with_message_batches(client):
+    pytest.importorskip("anthropic")
+    pytest.importorskip("httpx2")
+    from test_markup_batch import client as batch_client
+
+    from folivox.llm_anthropic import AnthropicLLM
+
+    bid = upload(client)
+    use_api(client)  # an OpenAI-compatible API: no Message Batches
+    assert client.get("/api/llm/models").json()["batches"] is False
+    est = client.get(f"/api/books/{bid}/llm/estimate").json()
+    assert "best_batch" not in est["cost"]["modes"]
+    r = client.post(f"/api/books/{bid}/llm/start", json={"task": "best", "batch": True})
+    assert r.status_code == 400 and "Message Batches" in r.json()["error"]
+
+    (client.data_dir.parent / "config.toml").write_text('[providers]\nllm = "anthropic"\n', encoding="utf-8")
+    config.load.cache_clear()
+    assert client.get("/api/llm/models").json()["batches"] is True
+    est = client.get(f"/api/books/{bid}/llm/estimate").json()
+    best, half = est["cost"]["modes"]["best"], est["cost"]["modes"]["best_batch"]
+    assert best["usd"] / 2 <= half["usd"] < best["usd"]  # the second looks stay at the full price
+    assert half["batch"] and half["batch_reading"]
+    assert est["modes"]["best"]["batch"]["rounds"] >= 2 and est["modes"]["best"]["batch"]["secs"] > 0
+
+    fake = batch_client(polls=0)  # ended at the first look: no wait between polls
+    client.holder["llm"] = AnthropicLLM(model="claude-haiku-5-5", client=fake)
+    r = client.post(f"/api/books/{bid}/llm/start", json={"task": "best", "model": "claude-haiku-5-5", "batch": True})
+    assert r.status_code == 202
+    st = wait(client, bid)
+    assert st["state"] == "done" and st["stats"]["marked"] == 3
+    sent = fake.messages.batches.created
+    assert len(sent) == 2  # one round reads the book (fewer windows than strands), one marks it

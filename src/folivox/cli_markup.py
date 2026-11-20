@@ -415,12 +415,25 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
                                               "then stop (nothing is sent)."),
                 max_cost: float | None = typer.Option(None, "--max-cost", show_default="no cap",
                                                       help="Stop cleanly (resumable) before the language model's "
-                                                      "spend passes N USD.")):
+                                                      "spend passes N USD."),
+                batch: bool = typer.Option(False, "--batch", help="Read and mark through Message Batches at half "
+                                           "price (--llm anthropic): rounds of about five minutes each instead of "
+                                           "one call at a time."),
+                strands: int | None = typer.Option(None, "--batch-strands", min=1, show_default="20",
+                                                   help="With --batch: the marking windows are cut into N strands "
+                                                   "of consecutive windows, one window of each per round (1 asks "
+                                                   "exactly what a run without --batch asks)."),
+                read_strands: int | None = typer.Option(None, "--batch-reading", min=0, show_default="8",
+                                                        help="With --batch: the reading windows are cut into N "
+                                                        "strands that each build their own character list, merged "
+                                                        "before marking (0: read one call at a time).")):
     from folivox import cli
     from folivox import markup as mk
     from folivox import markup_cost as mc
     from folivox import markup_llm as ml
 
+    strands = ml.BATCH_MARK_STRANDS if strands is None else strands
+    read_strands = ml.BATCH_READ_STRANDS if read_strands is None else read_strands
     book = cli._load(book_path)
     chs = book.chapters(depth)
     bp, cp, mp = ml.bible_path(book_path), ml.cache_path(book_path), file or mk.path_for(book_path)
@@ -433,7 +446,7 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
         extra = 8 + round(0.02 * sum(len(w.blocks) for w in marked)) if best else 0  # as the studio counts them
         return mc.estimate(chs, book.lang, bible, price, analyse=mc.analyse_windows(chs, bible) if reread else [],
                            annotate=marked, extra_calls=extra, expression_tags=expression, model=name,
-                           provider=provider)
+                           provider=provider, batch=batch, batch_reading=bool(batch and read_strands))
 
     if estimate:
         try:
@@ -445,6 +458,9 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
         _show_estimate(run_estimate(bible, name, _price(provider, name)), max_cost)
         return
     llm, model_name = _llm(llm_name, model)
+    if batch and not getattr(llm, "batches", False):
+        console.print(f"[red]--batch needs a provider with Message Batches (--llm anthropic), not {provider}.[/]")
+        raise typer.Exit(2)
     budget = _budget(provider, model_name, max_cost)
     if fresh:
         cp.unlink(missing_ok=True)
@@ -457,7 +473,8 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
             _show_estimate(run_estimate(bible, model_name, budget.price), max_cost)
         if bible.sampled or bible.done_windows < max(bible.total_windows, 1):  # a preview is not a full reading
             console.print("Reading the book for its characters first…")
-            bible = ml.analyse(chs, book.lang, runner, bible, save=lambda b: b.save(bp), progress=_progress())
+            bible = ml.analyse(chs, book.lang, runner, bible, save=lambda b: b.save(bp), progress=_progress(),
+                               strands=read_strands if batch else 0)
         if best:
             console.print("Looking at the characters again…")
             ml.consolidate(chs, book.lang, bible, runner, save=lambda b: b.save(bp), progress=_progress())
@@ -470,7 +487,8 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
 
         console.print(f"Marking speakers with {model_name}{' and expression tags' if expression else ''}…")
         markup, stats = ml.annotate(chs, book.lang, bible, runner, markup, expression_tags=expression,
-                                    chapter_filter=chosen, save=save, progress=_progress(), depth=depth)
+                                    chapter_filter=chosen, save=save, progress=_progress(), depth=depth,
+                                    strands=strands if batch else 0)
         if best:
             console.print("Asking again about the doubtful places…")
             settled, left = ml.second_opinion(chs, book.lang, bible, runner, markup, save=save, progress=_progress())

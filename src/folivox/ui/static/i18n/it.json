@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "mancano {t}",
  "mk.cost": "≈ ${usd}, fino a ${max}",
+ "mk.batch": "In batch (metà prezzo, più lento)",
  "mk.cost.unknown": "{n} token, prezzo sconosciuto",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

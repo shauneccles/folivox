@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} مانده",
  "mk.cost": "≈ ${usd}, تا ${max}",
+ "mk.batch": "دسته‌ای (نصف قیمت، کندتر)",
  "mk.cost.unknown": "{n} توکن، قیمت نامعلوم",
  "mk.dur.under": "< 1 دقیقه",
  "mk.dur.min": "{n} دقیقه",

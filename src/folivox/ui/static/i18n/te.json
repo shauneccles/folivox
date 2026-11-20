@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} మిగిలింది",
  "mk.cost": "≈ ${usd}, గరిష్ఠంగా ${max}",
+ "mk.batch": "బ్యాచ్ (సగం ధర, నెమ్మదిగా)",
  "mk.cost.unknown": "{n} టోకెన్లు, ధర తెలియదు",
  "mk.dur.under": "< 1 నిమి",
  "mk.dur.min": "{n} నిమి",

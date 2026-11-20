@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "mbeten {t}",
  "mk.cost": "≈ ${usd}, deri në ${max}",
+ "mk.batch": "Me grupe (gjysmë çmimi, më ngadalë)",
  "mk.cost.unknown": "{n} tokena, çmimi i panjohur",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

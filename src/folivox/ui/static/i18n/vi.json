@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "còn {t}",
  "mk.cost": "≈ ${usd}, tối đa ${max}",
+ "mk.batch": "Theo lô (nửa giá, chậm hơn)",
  "mk.cost.unknown": "{n} token, chưa rõ giá",
  "mk.dur.under": "< 1 phút",
  "mk.dur.min": "{n} phút",

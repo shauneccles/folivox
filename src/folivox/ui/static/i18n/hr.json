@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "preostalo {t}",
  "mk.cost": "≈ ${usd}, do ${max}",
+ "mk.batch": "U skupinama (pola cijene, sporije)",
  "mk.cost.unknown": "{n} tokena, cijena nepoznata",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

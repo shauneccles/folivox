@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "المتبقي {t}",
  "mk.cost": "≈ ${usd}, حتى ${max}",
+ "mk.batch": "دفعات (نصف السعر، أبطأ)",
  "mk.cost.unknown": "{n} رمز، السعر غير معروف",
  "mk.dur.under": "< 1 د",
  "mk.dur.min": "{n} د",

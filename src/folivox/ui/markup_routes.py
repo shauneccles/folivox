@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import shutil
 import threading
 import time
@@ -57,6 +58,20 @@ class Pull:
                 "message": self.message, "elapsed": round(time.time() - self.started, 1) if self.started else 0}
 
 
+def has_batches(provider: str) -> bool:
+    """Whether the provider's model client can send Message Batches (batch mode), read without making one."""
+    from folivox.llm import LLMS
+
+    try:
+        module, _, attr = LLMS.get(provider).target.partition(":")
+        factory = importlib.import_module(module)
+        for part in attr.split("."):
+            factory = getattr(factory, part)
+    except (ImportError, AttributeError, ValueError, RuntimeError):
+        return False
+    return bool(getattr(factory, "batches", False))
+
+
 def unload(t: Task) -> None:
     """Free the model a stopped run used (Ollama would keep it for minutes); a hosted endpoint has nothing to free."""
     fn = getattr(t.llm, "unload", None)
@@ -88,7 +103,7 @@ def routes(api_error, state, services: dict) -> list[Route]:
         if not mc.is_local(provider):  # a paid API: its configured model and the well-known ones, no downloads
             return JSONResponse({"provider": provider, "local": False, "configured": mc.default_model(provider),
                                  "known": mc.known_models(provider), "installed": [], "tiers": [],
-                                 "running": True, "recommended": ""})
+                                 "running": True, "recommended": "", "batches": has_batches(provider)})
         ram = diag.ram_gb()
         ollama = Ollama()
         return JSONResponse({"provider": provider, "local": True, "ram_gb": ram, "recommended": recommend_model(ram),
@@ -239,6 +254,10 @@ def routes(api_error, state, services: dict) -> list[Route]:
                                        annotate=mc.annotate_windows(chapters, None, PREVIEW_MARK)),
                 "best": mc.estimate(chapters, book.lang, bible, price, model=model, provider=provider,
                                     analyse=mc.analyse_windows(chapters, bible), annotate=speech, extra_calls=extra)}
+        if has_batches(provider):  # the same run through Message Batches, at half price
+            runs["best_batch"] = mc.estimate(chapters, book.lang, bible, price, model=model, provider=provider,
+                                             analyse=mc.analyse_windows(chapters, bible), annotate=speech,
+                                             extra_calls=extra, batch=True, batch_reading=True)
         return {"provider": provider, "model": model, "local": mc.is_local(provider),
                 "modes": {k: v.to_dict() for k, v in runs.items()}}
 
@@ -277,6 +296,9 @@ def routes(api_error, state, services: dict) -> list[Route]:
                           # the second look: the merge and the unsure characters, then the doubtful places (measured:
                           # about 1 in 100 paragraphs after the rule check was tuned)
                           "extra": 8 + round(0.02 * paragraphs)}}
+        best = modes["best"]  # batch mode: rounds of minutes each, a window of every strand per round
+        rounds = -(-best["analyse"] // ml.BATCH_READ_STRANDS) + -(-best["annotate"] // ml.BATCH_MARK_STRANDS)
+        best["batch"] = {"rounds": rounds, "secs": rounds * ml.BATCH_ROUND_SECONDS}
         # the average window of each stage (a short book has short windows, and the page counts time by them)
         read_chars = round(sum(len(w.text()) for w in every) / len(every)) if every else ml.WINDOW_CHARS
         mark_chars = round(sum(len(w.text()) for w in speech) / len(speech)) if speech else ml.WINDOW_CHARS
@@ -341,6 +363,11 @@ def routes(api_error, state, services: dict) -> list[Route]:
         depth = int(body.get("depth", 2))
         chapters = book.chapters(depth)
         expression = bool(body.get("expression_tags", False))
+        batch = bool(body.get("batch", False)) and what in ("best", "auto")  # a preview stays quick
+        if batch and not getattr(llm, "batches", False):
+            raise api_error("Batch mode needs a language model provider with Message Batches (anthropic)")
+        read_strands = ml.BATCH_READ_STRANDS if batch else 0
+        mark_strands = ml.BATCH_MARK_STRANDS if batch else 0
         sample = int(body["sample"]) if body.get("sample") else None
         only = body.get("chapters")
         if only and not isinstance(only, list):  # a string "12" would be read digit by digit
@@ -398,7 +425,8 @@ def routes(api_error, state, services: dict) -> list[Route]:
 
                 preview = what == "preview"
                 bible = ml.analyse(chapters, book.lang, runner, bible, save=save_b, progress=progress,
-                                   max_windows=PREVIEW_ANALYSE if preview else None, cancelled=t.cancel.is_set)
+                                   max_windows=PREVIEW_ANALYSE if preview else None, cancelled=t.cancel.is_set,
+                                   strands=read_strands)
                 if not preview and not t.cancel.is_set():
                     ml.consolidate(chapters, book.lang, bible, runner, save=save_b, progress=progress,
                                    cancelled=t.cancel.is_set)
@@ -406,7 +434,7 @@ def routes(api_error, state, services: dict) -> list[Route]:
                     markup, stats = ml.annotate(chapters, book.lang, bible, runner, markup,
                                                 chapter_filter=None if preview else chapter_filter, save=save_m,
                                                 progress=progress, cancelled=t.cancel.is_set, depth=depth,
-                                                max_windows=PREVIEW_MARK if preview else None)
+                                                max_windows=PREVIEW_MARK if preview else None, strands=mark_strands)
                     t.stats = dict(stats.__dict__)
                     if not preview and not t.cancel.is_set():
                         settled, left = ml.second_opinion(chapters, book.lang, bible, runner, markup, save=save_m,
@@ -436,7 +464,7 @@ def routes(api_error, state, services: dict) -> list[Route]:
                 if what == "analyse" or bible.sampled or bible.done_windows < max(bible.total_windows, 1):
                     bible = ml.analyse(chapters, book.lang, runner, bible, save=lambda b: b.save(bp),
                                        max_windows=sample if what == "analyse" else None, progress=progress,
-                                       cancelled=t.cancel.is_set)
+                                       cancelled=t.cancel.is_set, strands=read_strands)
                 if what == "auto" and not t.cancel.is_set():
                     markup = mk.Markup.load(mp) if mp.is_file() else mk.Markup(depth=depth)
 
@@ -447,7 +475,8 @@ def routes(api_error, state, services: dict) -> list[Route]:
 
                     markup, stats = ml.annotate(chapters, book.lang, bible, runner, markup,
                                                 expression_tags=expression, chapter_filter=chapter_filter, save=save,
-                                                progress=progress, cancelled=t.cancel.is_set, depth=depth)
+                                                progress=progress, cancelled=t.cancel.is_set, depth=depth,
+                                                strands=mark_strands)
                     mk.stamp(markup, chapters)
                     markup.save(mp)
                     bible.save(bp)

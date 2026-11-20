@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "残り {t}",
  "mk.cost": "≈ ${usd}（最大 ${max}）",
+ "mk.batch": "バッチ（半額、時間がかかる）",
  "mk.cost.unknown": "{n} トークン、価格不明",
  "mk.dur.under": "< 1 分",
  "mk.dur.min": "{n} 分",

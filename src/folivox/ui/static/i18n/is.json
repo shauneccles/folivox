@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} eftir",
  "mk.cost": "≈ ${usd}, allt að ${max}",
+ "mk.batch": "Í lotum (hálft verð, hægara)",
  "mk.cost.unknown": "{n} tókar, verð óþekkt",
  "mk.dur.under": "< 1 mín.",
  "mk.dur.min": "{n} mín.",

@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} उरले",
  "mk.cost": "≈ ${usd}, जास्तीत जास्त ${max}",
+ "mk.batch": "बॅच (अर्धी किंमत, हळू)",
  "mk.cost.unknown": "{n} टोकन, किंमत अज्ञात",
  "mk.dur.under": "< 1 मि",
  "mk.dur.min": "{n} मि",

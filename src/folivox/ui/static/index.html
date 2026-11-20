@@ -361,6 +361,7 @@ dialog ul { padding-inline-start:18px; margin:10px 0; } dialog li { margin:6px 0
           <progress id="mk-dlprog" max="100" value="0" hidden style="width:100%;margin-top:6px"></progress>
           <div id="mk-dlmsg" class="mute" style="font-size:12.5px;margin-top:4px"></div>
           <label class="f" id="mk-capbox" hidden style="margin-top:8px"><span data-i18n="s3.cap">Spending cap, $ (optional)</span><input id="mk-max_cost" type="number" min="0.1" step="0.1" placeholder="no cap" data-i18n-attr="placeholder:s3.cap.ph"></label>
+          <label class="consent" id="mk-batchbox" hidden style="margin-top:8px"><input type="checkbox" id="mk-batch"><span data-i18n="mk.batch">Batch (half price, slower)</span></label>
         </details>
       </div>
       <div id="mk-step" class="mk-nextstep" hidden></div>
@@ -1365,6 +1366,7 @@ async function mkLlmModels() {
     const has = (x) => m.installed.includes(x);
     add(m.configured, t("mk.model.configured"));
     $("#mk-capbox").hidden = m.local !== false;
+    $("#mk-batchbox").hidden = !(m.local === false && m.batches);  // Message Batches: half the price, rounds of minutes
     if (m.local === false) {  // a paid API: its configured model and the well-known ones; nothing to download
       (m.known || []).forEach(x => add(x, "")); $("#mk-model").innerHTML = opts.join(""); if (m.configured) $("#mk-model").value = m.configured; return;
     }
@@ -1464,13 +1466,18 @@ function mkModeSecs(model, est, mode) {
   const base = mkSecs(model, est), x = est.modes[mode], ne = (x.extra || 0) / 4;  // a short call is a quarter of a reading window
   return { a: base.a, m: base.m, na: x.analyse, nm: x.annotate, ne, total: (x.analyse + ne) * base.a + x.annotate * base.m };
 }
+const mkBatchOn = () => !$("#mk-batchbox").hidden && $("#mk-batch").checked;
+// a batch run of the whole book: rounds of minutes each (the server counts them), the short second looks one at a time
+const mkBatchSecs = (model, est) => est.modes.best.batch.secs + mkModeSecs(model, est, "best").ne * mkSecs(model, est).a;
 const mkApprox = (sec) => sec < 60 ? t("mk.dur.under") : t("mk.eta.approx", { t: mkDur(sec) });  // "about under a minute" reads wrong
 const mkEtaText = (model, est) => mkApprox(mkSecs(model, est).total);
 async function mkEtaEditor() {
   if (!book || !$("#mk-dlg").open) return;
   try {
     const model = $("#mk-model").value, est = await mkEstimate(0, selected());
-    $("#mk-eta-best").textContent = mkWithCost(mkApprox(mkModeSecs(model, est, "best").total), est.cost, "best");
+    const batch = mkBatchOn() && est.modes.best.batch && est.cost && est.cost.modes && est.cost.modes.best_batch;
+    $("#mk-eta-best").textContent = batch ? mkWithCost(mkApprox(mkBatchSecs(model, est)), est.cost, "best_batch")
+      : mkWithCost(mkApprox(mkModeSecs(model, est, "best").total), est.cost, "best");
     $("#mk-eta-prev").textContent = mkWithCost(mkApprox(mkModeSecs(model, est, "preview").total), est.cost, "preview");
   } catch (e) { $("#mk-eta-best").textContent = $("#mk-eta-prev").textContent = ""; }
 }
@@ -1479,12 +1486,13 @@ function mkModelHint() {
   $("#mk-modelhint").textContent = key ? t(key) : "";
 }
 $("#mk-model").addEventListener("change", () => { mkModelHint(); mkModelButtons(); mkEtaEditor(); });
+$("#mk-batch").addEventListener("change", () => mkEtaEditor());
 const MK_STAGE = { analyse: "mk.run.read", consolidate: "mk.run.consol", annotate: "mk.run.mark", review: "mk.run.review" };
 const mkStageText = (s) => s.state !== "running" ? "" : !s.total ? t("mk.run.start") : t(MK_STAGE[s.stage] || "mk.run.mark", { d: s.done, n: s.total });
 // one run of the whole flow (characters, then speakers); ui = { busy(on), progress(pct, text), error(text) }
 async function mkAutoRun(task, o, ui, attach) {  // attach: the run is already going on in the server (reopened editor)
   const cap = $("#mk-capbox").hidden ? "" : $("#mk-max_cost").value;
-  const body = { task, model: o.model || undefined, expression_tags: !!o.tags, depth: (MK.data && MK.data.depth) || +$("#depth").value || 2, chapters: o.chapters, max_cost: cap ? +cap : undefined };
+  const body = { task, model: o.model || undefined, expression_tags: !!o.tags, depth: (MK.data && MK.data.depth) || +$("#depth").value || 2, chapters: o.chapters, max_cost: cap ? +cap : undefined, batch: !!o.batch };
   let sec = null;
   try {
     const est = await mkEstimate(0, o.chapters);
@@ -1552,7 +1560,7 @@ async function mkLlm(task, attach) {
     if (!mkAskDownload(model, MK.models) || !await mkEditorPull(model)) return;
   }
   const btns = ["#mk-best", "#mk-preview"], chosen = selected();
-  const s = await mkAutoRun(task, { model, chapters: task === "best" && chosen.length ? chosen : undefined }, {
+  const s = await mkAutoRun(task, { model, chapters: task === "best" && chosen.length ? chosen : undefined, batch: task === "best" && mkBatchOn() }, {
     busy: (on) => { btns.forEach(b => $(b).disabled = on); $("#mk-stop").hidden = !on; $("#mk-prog").hidden = !on; },
     progress: (pct, text) => { $("#mk-prog").value = pct; msg.textContent = text; },
     error: (m) => { msg.innerHTML = `<span class="err">${esc(m)}</span>`; } }, attach);

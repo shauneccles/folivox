@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "נותרו {t}",
  "mk.cost": "≈ ${usd}, עד ${max}",
+ "mk.batch": "באצווה (חצי מחיר, איטי יותר)",
  "mk.cost.unknown": "{n} טוקנים, המחיר לא ידוע",
  "mk.dur.under": "< דקה",
  "mk.dur.min": "{n} דק'",

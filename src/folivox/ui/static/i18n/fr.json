@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "reste {t}",
  "mk.cost": "≈ ${usd}, jusqu’à ${max}",
+ "mk.batch": "Par lots (moitié prix, plus lent)",
  "mk.cost.unknown": "{n} jetons, prix inconnu",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

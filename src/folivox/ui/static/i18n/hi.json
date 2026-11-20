@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} बाकी",
  "mk.cost": "≈ ${usd}, अधिकतम ${max}",
+ "mk.batch": "बैच (आधी कीमत, धीमा)",
  "mk.cost.unknown": "{n} टोकन, कीमत अज्ञात",
  "mk.dur.under": "< 1 मिनट",
  "mk.dur.min": "{n} मिनट",

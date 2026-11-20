@@ -340,6 +340,9 @@ class Cache:
     def __init__(self, path: Path | None):
         self.db = sqlite3.connect(str(path) if path else ":memory:")
         self.db.execute("CREATE TABLE IF NOT EXISTS replies (key TEXT PRIMARY KEY, reply TEXT NOT NULL)")
+        # requests sent in a Message Batch whose results have not been collected yet: a run stopped while it waited
+        # collects them next time instead of paying for them twice
+        self.db.execute("CREATE TABLE IF NOT EXISTS batches (key TEXT PRIMARY KEY, batch TEXT NOT NULL)")
 
     def get(self, key: str) -> str | None:
         row = self.db.execute("SELECT reply FROM replies WHERE key = ?", (key,)).fetchone()
@@ -347,6 +350,18 @@ class Cache:
 
     def put(self, key: str, reply: str) -> None:
         self.db.execute("INSERT OR REPLACE INTO replies VALUES (?, ?)", (key, reply))
+        self.db.commit()
+
+    def pending(self, key: str) -> str | None:
+        row = self.db.execute("SELECT batch FROM batches WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_pending(self, keys: list[str], batch: str) -> None:
+        self.db.executemany("INSERT OR REPLACE INTO batches VALUES (?, ?)", [(k, batch) for k in keys])
+        self.db.commit()
+
+    def collected(self, batch: str) -> None:
+        self.db.execute("DELETE FROM batches WHERE batch = ?", (batch,))
         self.db.commit()
 
     def close(self) -> None:
@@ -430,10 +445,112 @@ class Runner:
                 break
         raise last
 
+    BATCH_POLL = 15.0  # seconds between looks at a running Message Batch
+
+    def key(self, system: str, prompt: str) -> str:
+        return hashlib.sha1("\x1f".join((PROMPT_VERSION, self.model, system, str(prompt))).encode()).hexdigest()
+
+    def ask_batch(self, items: list[tuple], waiting: Callable[[str], None] | None = None) -> list | None:
+        """Answers to independent requests ``(system, prompt, validate[, JSON schema])`` sent as one Message Batch
+        (the llm's ``batch_submit`` / ``batch_status`` / ``batch_results``): each the dict ``validate`` returned, or
+        the ValueError the request ended with. Replies already in the cache are not asked again; one the batch could
+        not give (errored, expired, unusable, short) is asked again on its own with :meth:`ask`, once every usable
+        answer of the batch is in the cache; a short answer (:class:`ShortReply`) stands when the retries do no
+        better. None when the run was cancelled while the batch ran: its id stays in the cache file and the next run
+        collects it."""
+        keys = [self.key(it[0], it[1]) for it in items]
+        out: list = [None] * len(items)
+        todo = []
+        for i, ((_s, _p, validate, *_), key) in enumerate(zip(items, keys, strict=True)):
+            hit = self.cache.get(key)
+            if hit is not None:
+                try:
+                    out[i] = validate(extract_json(hit))
+                    self.cached += 1
+                    continue
+                except ValueError:
+                    pass
+            todo.append(i)
+        if not todo:
+            return out
+        replies = self._batch([(keys[i], *items[i][:2], items[i][3] if len(items[i]) > 3 else None) for i in todo],
+                              waiting)
+        if replies is None:
+            return None
+        again: dict[int, ShortReply | None] = {}  # asked again on its own, with the batch's short answer if it gave one
+        for i in todo:  # every usable answer is kept before any is asked again (a retry can stop at the cap)
+            reply = replies.get(keys[i])
+            short = None
+            if isinstance(reply, str):
+                try:
+                    out[i] = items[i][2](extract_json(reply))
+                    self.cache.put(keys[i], reply)
+                    continue
+                except ShortReply as e:
+                    short = e
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    pass
+            again[i] = short
+        for i, short in again.items():
+            system, prompt, validate, *schema = items[i]
+            try:  # one at a time, with the usual retries
+                out[i] = self.ask(system, prompt, validate, schema=schema[0] if schema else None)
+            except ShortReply as e:  # the most complete of the batch's answer and the retries
+                out[i] = e if short is None or len(e.missing) < len(short.missing) else short
+            except ValueError as e:
+                out[i] = short if short is not None else e
+        return out
+
+    def _batch(self, reqs: list[tuple[str, str, str, dict | None]], waiting) -> dict | None:
+        """Raw replies (or exceptions) by key for ``(key, system, prompt, schema)``: from a batch sent earlier and still
+        uncollected, else from a new one. Every billed reply is counted at the batch price."""
+        sent = {key: len(system) + len(prompt) for key, system, prompt, _ in reqs}
+        pending: dict[str, list[str]] = {}
+        new = []
+        for key, system, prompt, schema in reqs:
+            bid = self.cache.pending(key)
+            if bid:
+                pending.setdefault(bid, []).append(key)
+            else:
+                new.append((key, system, prompt, schema))
+        if new:
+            if self.budget is not None:
+                self.budget.check(sum(sent[k] for k, *_ in new), calls=len(new), batch=True)
+            bid = self.llm.batch_submit([(key, prompt, system, schema) for key, system, prompt, schema in new])
+            self.cache.set_pending([k for k, *_ in new], bid)
+            self.calls += len(new)
+            pending[bid] = [k for k, *_ in new]
+        replies: dict = {}
+        for bid in pending:
+            while True:
+                try:
+                    status = self.llm.batch_status(bid)
+                except ConnectionError:
+                    status = "unreachable"
+                if status == "ended":
+                    break
+                if self.cancelled():
+                    return None
+                if waiting:
+                    waiting(status)
+                self._wait(self.BATCH_POLL)
+                if self.cancelled():
+                    return None
+            for key, (reply, usage) in self.llm.batch_results(bid).items():
+                if self.budget is not None and (usage or isinstance(reply, str)):
+                    self.budget.record(usage, sent.get(key, 0), len(reply) if isinstance(reply, str) else 0,
+                                       batch=True)
+                if key in sent:
+                    replies[key] = reply
+                elif isinstance(reply, str):  # asked by an earlier run in another state: kept for a later window
+                    self.cache.put(key, reply)
+            self.cache.collected(bid)
+        return replies
+
     def ask(self, system: str, prompt: str, validate: Callable[[dict], dict], schema: dict | None = None) -> dict:
         """Reply parsed and checked by ``validate`` (which raises ValueError on a bad one). ``schema``: the JSON shape
         the prompt asks for, for a backend that can enforce it (structured outputs)."""
-        key = hashlib.sha1("\x1f".join((PROMPT_VERSION, self.model, system, str(prompt))).encode()).hexdigest()
+        key = self.key(system, prompt)
         hit = self.cache.get(key)
         if hit is not None:
             try:
@@ -627,10 +744,61 @@ def relevant_for(bible: Bible, window_text: str, recent: list[str]) -> list[Char
     return out[:MAX_RELEVANT]
 
 
+def _check_analysis(d: dict) -> dict:
+    if not isinstance(d.get("characters"), list):
+        raise ValueError("no characters list")
+    return d
+
+
+def _read_window(bible: Bible, w: Window, out: dict, narr: dict[str, int]) -> list[str]:
+    """Fold one window's answer into the bible; the names of the characters it reported (the next window's context)."""
+    person = str(out.get("narration_person", ""))
+    narr[person] = narr.get(person, 0) + 1
+    recent = []
+    for e in out["characters"]:
+        if isinstance(e, dict):
+            c = bible.merge(e, w.chapter)
+            if c:
+                recent.append(c.name)
+    return recent
+
+
+def _narration(bible: Bible, narr: dict[str, int]) -> None:
+    if narr:
+        top = max(narr, key=narr.get)
+        bible.narration = top if top in ("first", "third", "mixed") else bible.narration
+
+
+def merge_bibles(bible: Bible, others: list[Bible]) -> Bible:
+    """Fold bibles read side by side (one per strand of the book) into ``bible``: a character is the same person as
+    one already there when :meth:`Bible.find` matches its name, or one of its aliases unless their full names differ
+    (:func:`other_person`), and is folded in with :func:`merge_characters`. A pair missed here is left to
+    :func:`join_same_people`; a wrong join could not be undone."""
+    for other in others:
+        for c in other.characters:
+            keep = bible.find(c.name, c.gender) or next((x for x in (bible.find(a, c.gender) for a in c.aliases)
+                                                         if x and not other_person(x, c.name)), None)
+            if keep is None:
+                c.id = 0
+                bible.characters.append(c)
+            else:
+                had = keep.id
+                merge_characters(bible, keep, c)
+                keep.id = had
+    return bible
+
+
 def analyse(chapters: list, lang: str, runner: Runner, bible: Bible | None = None, *, max_windows: int | None = None,
             save: Callable[[Bible], None] | None = None, progress: Progress | None = None,
-            cancelled: Callable[[], bool] = lambda: False, window_chars: int = WINDOW_CHARS) -> Bible:
-    """Read the book once and fill the character bible. Resumable: windows done before are skipped."""
+            cancelled: Callable[[], bool] = lambda: False, window_chars: int = WINDOW_CHARS,
+            strands: int = 0) -> Bible:
+    """Read the book once and fill the character bible. Resumable: windows done before are skipped.
+
+    ``strands``: 0 reads one window at a time, each with the characters met so far. N > 0 reads through the
+    provider's Message Batches (half the price, minutes per round): the windows left are cut into N strands of
+    consecutive windows, every round sends the next window of each strand in one batch, each strand builds its own
+    bible as it goes, and once all are read the strand bibles are merged (:func:`merge_bibles`) and the model is
+    asked which names are one person (:func:`join_same_people`, as the consolidate pass asks)."""
     bible = bible or Bible()
     bible.lang, bible.model = lang, runner.model
     wins = windows(chapters, window_chars, only_speech=False)
@@ -644,46 +812,74 @@ def analyse(chapters: list, lang: str, runner: Runner, bible: Bible | None = Non
         bible.done_windows = bible.total_windows = 0  # (the characters are kept); the window lists differ
     bible.sampled = sampled
     bible.total_windows = len(wins)
-    recent: list[str] = []
-    narr: dict[str, int] = {}
-    for n, w in enumerate(wins):
-        if cancelled():
-            break
-        if n < bible.done_windows:
-            continue
+    lang_name = LANG_NAMES.get(lang, lang)
+
+    def request(b: Bible, w: Window, recent: list[str]) -> Prompt:
         text = w.text()
-        prompt = analyse_prompt(lang=LANG_NAMES.get(lang, lang), hints=QUOTE_HINTS,
-                                known=_known(bible, relevant_for(bible, text, recent)), text=text)
+        return analyse_prompt(lang=lang_name, hints=QUOTE_HINTS, known=_known(b, relevant_for(b, text, recent)),
+                              text=text)
 
-        def check(d: dict) -> dict:
-            if not isinstance(d.get("characters"), list):
-                raise ValueError("no characters list")
-            return d
+    if strands and bible.done_windows < len(wins):
+        if not getattr(runner.llm, "batches", False):
+            raise LLMError("Batch mode needs a provider that has Message Batches (--llm anthropic).")
+        start = bible.done_windows
+        groups = [[start + i for i in g] for g in strands_of(len(wins) - start, strands)]
+        parts = [Bible(lang) for _ in groups]
+        recents: list[list[str]] = [[] for _ in groups]
+        narr: dict[str, int] = {}
+        rounds = max((len(g) for g in groups), default=0)
+        done = 0
+        for r in range(rounds):
+            live = [i for i, g in enumerate(groups) if r < len(g)]
+            if cancelled():
+                return bible  # nothing merged: the next run asks again (the replies are in the cache)
 
-        try:
-            out = runner.ask(ANALYSE_SYSTEM, prompt, check, schema=ANALYSE_SCHEMA)
-        except ValueError as e:
+            def waiting(status: str, r=r, live=live, done=done) -> None:
+                if progress:
+                    progress("analyse", start + done, len(wins),
+                             f"round {r + 1}/{rounds}: {len(live)} windows in a batch, {status}")
+
+            outs = runner.ask_batch([(ANALYSE_SYSTEM, request(parts[i], wins[groups[i][r]], recents[i]),
+                                      _check_analysis, ANALYSE_SCHEMA) for i in live], waiting=waiting)
+            if outs is None:
+                return bible
+            for i, out in zip(live, outs, strict=True):
+                if not isinstance(out, Exception):
+                    recents[i] = _read_window(parts[i], wins[groups[i][r]], out, narr)
+            done += len(live)
             if progress:
-                progress("analyse", n + 1, len(wins), f"window {n + 1} skipped: {e}")
+                progress("analyse", start + done, len(wins),
+                         f"round {r + 1}/{rounds}: {sum(len(p.characters) for p in parts)} characters in "
+                         f"{len(parts)} strands")
+        merge_bibles(bible, parts)
+        if len(parts) > 1:  # the strands may know one person under different names: the consolidate pass's question
+            join_same_people(lang, bible, runner)
+        _narration(bible, narr)
+        bible.done_windows = len(wins)
+    else:
+        recent: list[str] = []
+        narr = {}
+        for n, w in enumerate(wins):
+            if cancelled():
+                break
+            if n < bible.done_windows:
+                continue
+            try:
+                out = runner.ask(ANALYSE_SYSTEM, request(bible, w, recent), _check_analysis, schema=ANALYSE_SCHEMA)
+            except ValueError as e:
+                if progress:
+                    progress("analyse", n + 1, len(wins), f"window {n + 1} skipped: {e}")
+                bible.done_windows = n + 1
+                if save:
+                    save(bible)
+                continue
+            recent = _read_window(bible, w, out, narr)
             bible.done_windows = n + 1
+            _narration(bible, narr)
             if save:
                 save(bible)
-            continue
-        narr[str(out.get("narration_person", ""))] = narr.get(str(out.get("narration_person", "")), 0) + 1
-        recent = []
-        for e in out["characters"]:
-            if isinstance(e, dict):
-                c = bible.merge(e, w.chapter)
-                if c:
-                    recent.append(c.name)
-        bible.done_windows = n + 1
-        if narr:
-            top = max(narr, key=narr.get)
-            bible.narration = top if top in ("first", "third", "mixed") else bible.narration
-        if save:
-            save(bible)
-        if progress:
-            progress("analyse", n + 1, len(wins), f"{len(bible.characters)} characters")
+            if progress:
+                progress("analyse", n + 1, len(wins), f"{len(bible.characters)} characters")
     bible.assign_ids()
     if save:
         save(bible)
@@ -748,6 +944,41 @@ def merge_characters(bible: Bible, keep: Character, other: Character) -> None:
     bible.characters = [c for c in bible.characters if c is not other]
 
 
+def join_same_people(lang: str, bible: Bible, runner: Runner) -> bool:
+    """Ask the model which of the characters are one person under several names and fold each group into the one with
+    the most lines (never two of known, different genders). False when there were too few characters to ask about."""
+    names = [c for c in bible.characters if c.lines > 0 or c.role == "main"]
+    if len(names) < 3:
+        return False
+    rows = json.dumps([{"name": c.name, "aliases": c.aliases[:5], "gender": c.gender or "?", "lines": c.lines}
+                       for c in names[:60]], ensure_ascii=False)
+    try:
+        out = runner.ask(CONSOLIDATE_SYSTEM, MERGE_PROMPT.format(lang=LANG_NAMES.get(lang, lang), rows=rows),
+                         _same_list, schema=SAME_SCHEMA)
+    except ValueError:
+        out = {"same": []}
+    for group in out["same"]:
+        found: dict[int, tuple[Character, list[str]]] = {}  # each character with the names that found it
+        for n in (str(x) for x in group if isinstance(x, str)):
+            hits = [c for c in bible.characters if c.matches(n)]
+            if len(hits) > 1:  # a name two characters share (a first name) points at neither
+                continue
+            c = hits[0] if hits else bible.find(n)
+            if c:
+                found.setdefault(id(c), (c, []))[1].append(n)
+        if len(found) < 2:
+            continue
+        keep, keep_by = max(found.values(), key=lambda f: f[0].lines)
+        for other, by in list(found.values()):
+            if other is keep or (keep.gender and other.gender and keep.gender != other.gender):
+                continue
+            # two different full names are one person only when the model named both in full
+            if other_person(keep, other.name) and not (_full(by) and _full(keep_by)):
+                continue
+            merge_characters(bible, keep, other)
+    return True
+
+
 def _snippets(chapters: list, c: Character, n: int = 8, width: int = 320) -> list[str]:
     """Up to ``n`` paragraphs that name the character, spread over the whole book."""
     keys = [norm_name(x) for x in c.names() if len(norm_name(x)) >= 3]
@@ -768,34 +999,7 @@ def consolidate(chapters: list, lang: str, bible: Bible, runner: Runner, *, max_
                 cancelled: Callable[[], bool] = lambda: False) -> Bible:
     """After the whole book is read: join the names that are one person, then look again, with passages from all
     over the book, at every character whose gender or age is still a guess."""
-    names = [c for c in bible.characters if c.lines > 0 or c.role == "main"]
-    if len(names) >= 3 and not cancelled():
-        rows = json.dumps([{"name": c.name, "aliases": c.aliases[:5], "gender": c.gender or "?", "lines": c.lines}
-                           for c in names[:60]], ensure_ascii=False)
-        try:
-            out = runner.ask(CONSOLIDATE_SYSTEM, MERGE_PROMPT.format(lang=LANG_NAMES.get(lang, lang), rows=rows),
-                             _same_list, schema=SAME_SCHEMA)
-        except ValueError:
-            out = {"same": []}
-        for group in out["same"]:
-            found: dict[int, tuple[Character, list[str]]] = {}  # each character with the names that found it
-            for n in (str(x) for x in group if isinstance(x, str)):
-                hits = [c for c in bible.characters if c.matches(n)]
-                if len(hits) > 1:  # a name two characters share (a first name) points at neither
-                    continue
-                c = hits[0] if hits else bible.find(n)
-                if c:
-                    found.setdefault(id(c), (c, []))[1].append(n)
-            if len(found) < 2:
-                continue
-            keep, keep_by = max(found.values(), key=lambda f: f[0].lines)
-            for other, by in list(found.values()):
-                if other is keep or (keep.gender and other.gender and keep.gender != other.gender):
-                    continue
-                # two different full names are one person only when the model named both in full
-                if other_person(keep, other.name) and not (_full(by) and _full(keep_by)):
-                    continue
-                merge_characters(bible, keep, other)
+    if not cancelled() and join_same_people(lang, bible, runner):
         bible.assign_ids()
         if save:
             save(bible)
@@ -1223,13 +1427,53 @@ def sync_speakers(markup: mk.Markup, bible: Bible) -> None:
         sp.notes = sp.notes or c.traits
 
 
+BATCH_READ_STRANDS = 8  # batch mode's reading strands: few and long, each builds its own character list
+BATCH_MARK_STRANDS = 20  # batch mode's marking strands
+BATCH_ROUND_SECONDS = 330  # a Message Batches round took about five and a half minutes, whatever its size (2026-11)
+
+
+@dataclass
+class _Strand:
+    """Consecutive windows marked in order, with their own recent context (batch mode runs several side by side)."""
+
+    wins: list[int]
+    before: str = ""  # the paragraphs just before the first window, without speakers (a strand that starts mid-book)
+    names: list[str] = field(default_factory=list)
+    ctx: list[str] = field(default_factory=list)
+
+
+def strands_of(n: int, k: int) -> list[list[int]]:
+    """Window numbers 0..n-1 cut into at most ``k`` contiguous strands of nearly equal length."""
+    k = max(1, min(k, n))
+    size, extra = divmod(n, k)
+    out, start = [], 0
+    for i in range(k):
+        end = start + size + (1 if i < extra else 0)
+        out.append(list(range(start, end)))
+        start = end
+    return [g for g in out if g]
+
+
+def _context_before(w: Window) -> str:
+    """The context for a strand's first window: the last paragraphs of the window before it, speakers not yet known."""
+    lines = [f"{t[:140]} -> ?" for _b, t in w.blocks[-4:]]
+    return "Context, the previous paragraphs (who spoke them is not known yet):\n" + "\n".join(lines) + "\n"
+
+
 def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk.Markup | None = None, *,
              expression_tags: bool = False, chapter_filter: set[int] | None = None,
              save: Callable[[mk.Markup, Bible], None] | None = None, progress: Progress | None = None,
              cancelled: Callable[[], bool] = lambda: False, window_chars: int = WINDOW_CHARS,
              depth: int = 2, method: str | None = None,
-             max_windows: int | None = None, other_langs: list[str] | None = None) -> tuple[mk.Markup, AnnotateStats]:
+             max_windows: int | None = None, other_langs: list[str] | None = None,
+             strands: int = 0) -> tuple[mk.Markup, AnnotateStats]:
     """Mark who speaks in every paragraph with speech. Existing spans in the paragraphs processed are replaced.
+
+    ``strands``: 0 asks one window at a time, each with the speakers of the window before as context. N > 0 sends the
+    windows through the provider's Message Batches (half the price, minutes per round): they are cut into N strands of
+    consecutive windows and every round sends the next window of each strand in one batch; a strand carries its own
+    context, and one that starts mid-book is shown the paragraphs before it without speakers. N = 1 asks exactly what
+    the one-at-a-time run asks.
 
     ``method``: "parts" (the default: the paragraph is cut here and the model only says which parts each character
     speaks; no expression tags) or "text" (the model repeats each paragraph with markers; used with expression tags)."""
@@ -1248,30 +1492,12 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
     tags_known = mk.known_tags() if expression_tags else set()
     tag_list = _tag_list() if expression_tags else ""
     others = other_languages(chapters, lang) if by_parts and other_langs is None else list(other_langs or ())
-    recent_names: list[str] = []
-    recent_ctx: list[str] = []
 
-    last_window = {w.chapter: n for n, w in enumerate(wins)}
-    for n, w in enumerate(wins):
-        if cancelled():
-            break
-        text = w.text()
-        relevant = speakers_for(bible, text, recent_names, _caches(runner))
-        recent = ""
-        if recent_ctx:
-            recent = "Context, the previous paragraphs and who spoke them:\n" + "\n".join(recent_ctx[-4:]) + "\n"
-        if by_parts:
-            prompt = parts_prompt(lang, others, hints=QUOTE_HINTS, person=bible.narration or "third",
-                                  speakers=_speakers_json(bible, relevant), recent=recent, text=parts_text(w.blocks))
-        else:
-            prompt = annotate_prompt(
-                lang=LANG_NAMES.get(lang, lang), hints=QUOTE_HINTS, person=bible.narration or "third",
-                speakers=_speakers_json(bible, relevant), recent=recent, text=text,
-                expression=EXPRESSION_RULES.format(tags=tag_list) if expression_tags else "")
-        originals = dict(w.blocks)
-        must = [b for b, t in w.blocks if DIALOGUE_START.search(t)]  # paragraphs that open with speech
+    def checker(w: Window) -> Callable[[dict], dict]:
+        """A reply must answer every paragraph of the window that opens with speech; a short one raises ShortReply."""
+        must = [b for b, t in w.blocks if DIALOGUE_START.search(t)]
 
-        def check(d: dict, must=must) -> dict:
+        def check(d: dict) -> dict:
             if not isinstance(d.get("blocks"), list):
                 raise ValueError("no blocks list")
             answered = set()
@@ -1285,21 +1511,45 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
                 raise ShortReply(d, missing)
             return d
 
-        try:
-            out = runner.ask(PARTS_SYSTEM if by_parts else ANNOTATE_SYSTEM, prompt, check)
-        except ShortReply as e:  # asked again and still short: keep what it answered, the rest goes on the list
-            out = e.reply
-            stats.short_windows += 1
-            if progress:
-                progress("annotate", n + 1, len(wins),
-                         f"window {n + 1}: the model left out {len(e.missing)} paragraph(s) with speech")
-        except ValueError:
-            stats.failed_windows += 1
-            stats.blocks += len(w.blocks)
-            stats.fell_back += len(w.blocks)
-            if progress:
-                progress("annotate", n + 1, len(wins), f"window {n + 1}: the narrator reads it")
-            continue
+        return check
+
+    system = PARTS_SYSTEM if by_parts else ANNOTATE_SYSTEM
+
+    def request(w: Window, st: _Strand) -> Prompt:
+        """The prompt for window ``w`` from the bible as it is now and the strand's own recent context."""
+        text = w.text()
+        relevant = speakers_for(bible, text, st.names, _caches(runner))
+        recent = ""
+        if st.ctx:
+            recent = "Context, the previous paragraphs and who spoke them:\n" + "\n".join(st.ctx[-4:]) + "\n"
+        elif st.before:
+            recent = st.before
+        if by_parts:
+            return parts_prompt(lang, others, hints=QUOTE_HINTS, person=bible.narration or "third",
+                                speakers=_speakers_json(bible, relevant), recent=recent, text=parts_text(w.blocks))
+        return annotate_prompt(
+            lang=LANG_NAMES.get(lang, lang), hints=QUOTE_HINTS, person=bible.narration or "third",
+            speakers=_speakers_json(bible, relevant), recent=recent, text=text,
+            expression=EXPRESSION_RULES.format(tags=tag_list) if expression_tags else "")
+
+    def short(n: int, e: ShortReply) -> dict:
+        """Asked again and still short: keep what it answered, the rest goes on the review list."""
+        stats.short_windows += 1
+        if progress:
+            progress("annotate", len(attempted), len(wins),
+                     f"window {n + 1}: the model left out {len(e.missing)} paragraph(s) with speech")
+        return e.reply
+
+    def fail(n: int, w: Window) -> None:
+        stats.failed_windows += 1
+        stats.blocks += len(w.blocks)
+        stats.fell_back += len(w.blocks)
+        if progress:
+            progress("annotate", len(attempted), len(wins), f"window {n + 1}: the narrator reads it")
+
+    def apply(n: int, w: Window, out: dict, st: _Strand) -> None:
+        """Take one window's answer, exactly as a run that asks one window at a time does."""
+        originals = dict(w.blocks)
         # characters the model met for the first time
         found = [x for k in ("new_characters", "updates") if isinstance(out.get(k), list) for x in out[k]]
         for e in found:
@@ -1316,7 +1566,7 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
         ids = {c.id for c in bible.characters if c.id} | {0}
         by_name = {c.id: c.name for c in bible.characters if c.id}
         seen: set[int] = set()
-        recent_names = []
+        st.names = []
         cm = markup.chapter(w.chapter, chapters[w.chapter].title, mk.chapter_sig(chapters[w.chapter]))
         for item in out["blocks"]:
             try:
@@ -1367,8 +1617,8 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
             if good_spans or good_marks:
                 stats.marked += 1
                 names = [by_name.get(s.speaker, "narrator") for s in good_spans if s.speaker] or ["narrator"]
-                recent_names += [by_name[s.speaker] for s in good_spans if s.speaker in by_name]
-                recent_ctx.append(f"{original[:140]} -> {', '.join(dict.fromkeys(names))}")
+                st.names += [by_name[s.speaker] for s in good_spans if s.speaker in by_name]
+                st.ctx.append(f"{original[:140]} -> {', '.join(dict.fromkeys(names))}")
         missing = [b for b, _ in w.blocks if b not in seen]
         stats.blocks += len(missing)  # paragraphs the model skipped: the narrator reads them
         stats.unanswered += len(missing)
@@ -1377,14 +1627,80 @@ def annotate(chapters: list, lang: str, bible: Bible, runner: Runner, markup: mk
                 cm.review = [r for r in cm.review if r.get("b") != b] + [{"b": b, "code": "skipped"}]
                 stats.flagged += 1
                 stats.skipped += 1
-        if last_window[w.chapter] == n and not sampled:
-            cm.done = True  # every window of this chapter has been through the model
+        answered.add(n)
         cm.spans.sort(key=lambda s: (s.block, s.start))
         cm.marks.sort(key=lambda m: (m.block, m.at))
+
+    by_chapter: dict[int, list[int]] = {}
+    for n, w in enumerate(wins):
+        by_chapter.setdefault(w.chapter, []).append(n)
+    attempted: set[int] = set()
+    answered: set[int] = set()
+
+    def finish() -> None:
+        """A chapter is done once every one of its windows has been through the model and its last one answered."""
+        if sampled:
+            return
+        for ch, ns in by_chapter.items():
+            if ns[-1] in answered and all(x in attempted for x in ns):
+                markup.chapter(ch).done = True
+
+    if not strands:  # one window at a time, each with the context of the one before
+        st = _Strand(list(range(len(wins))))
+        for n, w in enumerate(wins):
+            if cancelled():
+                break
+            attempted.add(n)
+            try:
+                out = runner.ask(system, request(w, st), checker(w))
+            except ShortReply as e:
+                out = short(n, e)
+            except ValueError:
+                fail(n, w)
+                continue
+            apply(n, w, out, st)
+            finish()
+            if save:
+                save(markup, bible)
+            if progress:
+                progress("annotate", n + 1, len(wins), f"{stats.marked} paragraphs marked")
+        return markup, stats
+
+    # Message Batches: the windows cut into strands; every round sends the next window of each strand in one batch
+    if not getattr(runner.llm, "batches", False):
+        raise LLMError("Batch mode needs a provider that has Message Batches (--llm anthropic).")
+    groups = strands_of(len(wins), strands)
+    sts = [_Strand(g, before=_context_before(wins[g[0] - 1]) if g[0] else "") for g in groups]
+    rounds = max((len(g) for g in groups), default=0)
+    for r in range(rounds):
+        live = [st for st in sts if r < len(st.wins)]
+        if cancelled() or not live:
+            break
+
+        def waiting(status: str, r=r, live=live) -> None:
+            if progress:
+                progress("annotate", len(attempted), len(wins),
+                         f"round {r + 1}/{rounds}: {len(live)} windows in a batch, {status}")
+
+        outs = runner.ask_batch([(system, request(wins[st.wins[r]], st), checker(wins[st.wins[r]])) for st in live],
+                                waiting=waiting)
+        if outs is None:  # stopped while the batch ran: the next run collects it
+            break
+        for st, out in zip(live, outs, strict=True):
+            n = st.wins[r]
+            attempted.add(n)
+            if isinstance(out, ShortReply):  # asked again on its own and still short
+                apply(n, wins[n], short(n, out), st)
+            elif isinstance(out, Exception):
+                fail(n, wins[n])
+            else:
+                apply(n, wins[n], out, st)
+        finish()
         if save:
             save(markup, bible)
         if progress:
-            progress("annotate", n + 1, len(wins), f"{stats.marked} paragraphs marked")
+            progress("annotate", len(attempted), len(wins),
+                     f"round {r + 1}/{rounds}: {stats.marked} paragraphs marked")
     return markup, stats
 
 

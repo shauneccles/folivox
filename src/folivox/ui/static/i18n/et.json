@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "jäänud {t}",
  "mk.cost": "≈ ${usd}, kuni ${max}",
+ "mk.batch": "Partiidena (poole hinnaga, aeglasem)",
  "mk.cost.unknown": "{n} tokenit, hind teadmata",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

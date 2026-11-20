@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} zimebaki",
  "mk.cost": "≈ ${usd}, hadi ${max}",
+ "mk.batch": "Kwa makundi (nusu bei, polepole zaidi)",
  "mk.cost.unknown": "tokeni {n}, bei haijulikani",
  "mk.dur.under": "< dak 1",
  "mk.dur.min": "dak {n}",

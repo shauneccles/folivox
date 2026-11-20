@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "mai {t}",
  "mk.cost": "≈ ${usd}, până la ${max}",
+ "mk.batch": "În loturi (preț la jumătate, mai lent)",
  "mk.cost.unknown": "{n} tokeni, preț necunoscut",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

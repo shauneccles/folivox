@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "atlicis {t}",
  "mk.cost": "≈ ${usd}, līdz ${max}",
+ "mk.batch": "Paketēs (par pusi lētāk, lēnāk)",
  "mk.cost.unknown": "{n} marķieri, cena nezināma",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "še {t}",
  "mk.cost": "≈ ${usd}, do ${max}",
+ "mk.batch": "V paketih (pol cene, počasneje)",
  "mk.cost.unknown": "{n} žetonov, cena neznana",
  "mk.dur.under": "< 1 min",
  "mk.dur.min": "{n} min",

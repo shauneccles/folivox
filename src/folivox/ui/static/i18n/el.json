@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "απομένουν {t}",
  "mk.cost": "≈ ${usd}, έως ${max}",
+ "mk.batch": "Σε παρτίδες (μισή τιμή, πιο αργά)",
  "mk.cost.unknown": "{n} tokens, άγνωστη τιμή",
  "mk.dur.under": "< 1 λ",
  "mk.dur.min": "{n} λ",

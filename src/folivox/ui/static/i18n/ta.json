@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} மீதம்",
  "mk.cost": "≈ ${usd}, அதிகபட்சம் ${max}",
+ "mk.batch": "தொகுதியாக (பாதி விலை, மெதுவாக)",
  "mk.cost.unknown": "{n} டோக்கன்கள், விலை தெரியவில்லை",
  "mk.dur.under": "< 1 நிமி",
  "mk.dur.min": "{n} நிமி",

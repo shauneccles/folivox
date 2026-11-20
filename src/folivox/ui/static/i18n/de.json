@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "noch {t}",
  "mk.cost": "≈ ${usd}, bis zu ${max}",
+ "mk.batch": "Stapelbetrieb (halber Preis, langsamer)",
  "mk.cost.unknown": "{n} Tokens, Preis unbekannt",
  "mk.dur.under": "< 1 Min.",
  "mk.dur.min": "{n} Min.",

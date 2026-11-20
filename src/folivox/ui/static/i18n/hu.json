@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} van hátra",
  "mk.cost": "≈ ${usd}, legfeljebb ${max}",
+ "mk.batch": "Kötegelt (fél áron, lassabb)",
  "mk.cost.unknown": "{n} token, az ár ismeretlen",
  "mk.dur.under": "< 1 p",
  "mk.dur.min": "{n} p",

@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "преостало {t}",
  "mk.cost": "≈ ${usd}, до ${max}",
+ "mk.batch": "У серијама (пола цене, спорије)",
  "mk.cost.unknown": "{n} токена, цена непозната",
  "mk.dur.under": "< 1 мин",
  "mk.dur.min": "{n} мин",

@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "остават {t}",
  "mk.cost": "≈ ${usd}, до ${max}",
+ "mk.batch": "На партиди (половин цена, по-бавно)",
  "mk.cost.unknown": "{n} токена, цената е неизвестна",
  "mk.dur.under": "< 1 мин",
  "mk.dur.min": "{n} мин",

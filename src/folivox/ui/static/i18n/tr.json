@@ -636,6 +636,7 @@
  "mk.eta.approx": "≈ {t}",
  "mk.eta.left": "{t} kaldı",
  "mk.cost": "≈ ${usd}, en fazla ${max}",
+ "mk.batch": "Toplu (yarı fiyat, daha yavaş)",
  "mk.cost.unknown": "{n} token, fiyat bilinmiyor",
  "mk.dur.under": "< 1 dk",
  "mk.dur.min": "{n} dk",
