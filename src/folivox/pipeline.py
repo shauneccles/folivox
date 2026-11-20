@@ -843,6 +843,9 @@ def render(book: Book, opts: RenderOptions, events: Events | None = None) -> Pat
 
         if tts_runtime.cosyvoice_native(opts.tts, opts.runtime or None):
             tts_runtime.require_ready()
+        from folivox.tts import consent
+
+        consent.check_main(opts)  # before any engine sees the voice: a cloud one would upload it
         if is_fish(opts.tts):
             from folivox.tts import fish_check
 
@@ -879,6 +882,7 @@ def render(book: Book, opts: RenderOptions, events: Events | None = None) -> Pat
             for w in voice.warnings_for(opts.tts):
                 events.warning(w)
         markup = load_markup(book, opts, events)
+        consent.check_speakers(markup, opts.tts)  # before a speaker's voice is loaded or made at the provider
         made: list = []
         if cloud:
             voices, made = cloud_speaker_voices(markup, engine, opts, journal, events)
