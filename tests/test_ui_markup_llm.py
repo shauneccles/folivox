@@ -244,3 +244,15 @@ def test_a_paid_api_offers_its_own_model_and_nothing_to_download(client):
     s = client.get("/api/settings").json()["kinds"]["llm"]
     assert any(p["name"] == "anthropic" and not p["local"] for p in s["providers"])
     assert any(k["name"] == "ANTHROPIC_API_KEY" for k in client.get("/api/keys").json()["keys"])
+
+
+def test_characters_on_a_shared_id_are_compared_with_themselves(client):
+    bid = upload(client)
+    client.post(f"/api/books/{bid}/llm/start", json={"task": "analyse"})
+    wait(client, bid)
+    bible = client.get(f"/api/books/{bid}/characters").json()
+    for c in bible["characters"]:  # both on the shared id 14 (more than 15 speakers in a real book)
+        c["id"], c["shared"] = 14, True
+    bible = client.put(f"/api/books/{bid}/characters", json=bible).json()
+    saved = client.put(f"/api/books/{bid}/characters", json=bible).json()  # saved again, nothing changed
+    assert all(max(c["votes"]["gender"].values()) < 1000 for c in saved["characters"])
