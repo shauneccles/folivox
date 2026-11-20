@@ -21,6 +21,10 @@ Example::
     price_in = 0.5                   # optional: USD per million tokens, for the markup cost estimate and --max-cost
     price_out = 2.0                  # (well-known models have built-in list prices, see folivox.markup_cost)
 
+    [llm.anthropic]                  # Claude through Anthropic's API (key: ANTHROPIC_API_KEY)
+    model = "claude-opus-5-5"
+    effort = "medium"                # optional: low | medium | high | xhigh | max
+
     [voicegen.qwen3-voicedesign]
     python = "~/.local/share/tts-bench/qwen3tts/.venv/bin/python"
     model = "~/.local/share/tts-bench/qwen3tts/models/VoiceDesign"

@@ -232,3 +232,15 @@ def test_a_hand_made_change_of_gender_is_not_outvoted(client):
     saved = client.put(f"/api/books/{bid}/characters", json=bible).json()
     again = next(c for c in saved["characters"] if c["name"] == "Анна")
     assert again["gender"] == "m" and again["votes"]["gender"]["m"] >= 1000 and "gender" not in again["unsure"]
+
+
+def test_a_paid_api_offers_its_own_model_and_nothing_to_download(client):
+    (client.data_dir.parent / "config.toml").write_text(
+        '[providers]\nllm = "anthropic"\n[llm.anthropic]\nmodel = "claude-haiku-5-5"\n', encoding="utf-8")
+    config.load.cache_clear()
+    m = client.get("/api/llm/models").json()
+    assert (m["provider"], m["local"], m["configured"]) == ("anthropic", False, "claude-haiku-5-5")
+    assert m["tiers"] == [] and m["installed"] == []
+    s = client.get("/api/settings").json()["kinds"]["llm"]
+    assert any(p["name"] == "anthropic" and not p["local"] for p in s["providers"])
+    assert any(k["name"] == "ANTHROPIC_API_KEY" for k in client.get("/api/keys").json()["keys"])
