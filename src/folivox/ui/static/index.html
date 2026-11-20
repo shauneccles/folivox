@@ -3155,7 +3155,7 @@ async function loadSettings() {
   $("#settings-note").textContent = t("set.file", { path: s.config_path });
   $("#o-output_dir").placeholder = s.output_dir;
 }
-const SERVICE = { GEMINI_API_KEY: "Google Gemini", OPENAI_API_KEY: "OpenAI", ELEVENLABS_API_KEY: "ElevenLabs", CARTESIA_API_KEY: "Cartesia", FISH_API_KEY: "Fish Audio" };
+const SERVICE = { GEMINI_API_KEY: "Google Gemini", OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", ELEVENLABS_API_KEY: "ElevenLabs", CARTESIA_API_KEY: "Cartesia", FISH_API_KEY: "Fish Audio" };
 const USED_FOR = new Proxy({}, { get: (_, k) => ["tts", "voicegen", "asr", "llm"].includes(k) ? t("used." + k) : undefined });
 async function loadKeys() {
   const { keys } = await api("/api/keys");
