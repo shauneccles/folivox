@@ -124,11 +124,12 @@ class AnthropicLLM(LLM):
     # -- Message Batches: the marking pass in rounds at half price (folivox.markup_llm.Runner.ask_batch) -------------
     batches = True
 
-    def batch_submit(self, items: list[tuple[str, str, str | None]]) -> str:
-        """One Message Batch of ``(custom id, prompt, system)``, built as single requests are (cache breakpoints,
-        thinking, effort); a batch takes no server-side fallbacks, so a refusal there is retried on its own. Returns
-        the batch id."""
-        reqs = [{"custom_id": cid, "params": self._request(prompt, system, None)} for cid, prompt, system in items]
+    def batch_submit(self, items: list[tuple]) -> str:
+        """One Message Batch of ``(custom id, prompt, system[, JSON schema])``, built as single requests are (cache
+        breakpoints, thinking, effort); a batch takes no server-side fallbacks, so a refusal there is retried on its
+        own. Returns the batch id."""
+        reqs = [{"custom_id": it[0], "params": self._request(it[1], it[2], it[3] if len(it) > 3 else None)}
+                for it in items]
         return self._call(lambda: self.client.messages.batches.create(requests=reqs)).id
 
     def batch_status(self, batch_id: str) -> str:

@@ -253,11 +253,20 @@ class Estimate:
     mark_input_tokens: int = 0  # the marking calls' share of the tokens, for the batch price
     mark_output_tokens: int = 0
     mark_output_tokens_max: int = 0
+    batch_reading: bool = False  # the reading calls go through Message Batches too
+    read_input_tokens: int = 0  # the reading calls' share of the tokens
+    read_output_tokens: int = 0
+    read_output_tokens_max: int = 0
 
-    def _discount(self, out: int) -> float:
-        if not (self.batch and self.price):
+    def _discount(self, mark_out: int, read_out: int) -> float:
+        if not self.price:
             return 0.0
-        return (1 - BATCH_PRICE) * self.price.usd(Usage(input=self.mark_input_tokens, output=out))
+        tokens = Usage()
+        if self.batch:
+            tokens.add({"input": self.mark_input_tokens, "output": mark_out})
+        if self.batch_reading:
+            tokens.add({"input": self.read_input_tokens, "output": read_out})
+        return (1 - BATCH_PRICE) * self.price.usd(tokens)
 
     @property
     def calls(self) -> int:
@@ -268,14 +277,14 @@ class Estimate:
         if not self.price:
             return None
         return self.price.usd(Usage(input=self.input_tokens, output=self.output_tokens)) - self._discount(
-            self.mark_output_tokens)
+            self.mark_output_tokens, self.read_output_tokens)
 
     @property
     def usd_max(self) -> float | None:
         if not self.price:
             return None
         return self.price.usd(Usage(input=self.input_tokens, output=self.output_tokens_max)) - self._discount(
-            self.mark_output_tokens_max)
+            self.mark_output_tokens_max, self.read_output_tokens_max)
 
     def to_dict(self) -> dict:
         return {"provider": self.provider, "model": self.model, "calls": self.calls,
@@ -286,7 +295,7 @@ class Estimate:
                 "price_source": self.price.source if self.price else "",
                 "usd": None if self.usd is None else round(self.usd, 4),
                 "usd_max": None if self.usd_max is None else round(self.usd_max, 4), "approximate": True,
-                "batch": self.batch}
+                "batch": self.batch, "batch_reading": self.batch_reading}
 
 
 def _stand_ins(bible):
@@ -342,14 +351,15 @@ def _parts_reply(blocks: list[tuple[int, str]]) -> int:
 
 def estimate(chapters: list, lang: str, bible, price: Price | None, *, analyse: list | None = None,
              annotate: list | None = None, extra_calls: int = 0, expression_tags: bool = False,
-             method: str | None = None, model: str = "", provider: str = "", batch: bool = False) -> Estimate:
+             method: str | None = None, model: str = "", provider: str = "", batch: bool = False,
+             batch_reading: bool = False) -> Estimate:
     """Tokens and USD of a run that sends the ``analyse`` and ``annotate`` windows (from :func:`analyse_windows` /
     :func:`annotate_windows`) and ``extra_calls`` short second-look calls, built as the passes build them."""
     import os
 
     from folivox import markup_llm as ml
 
-    est = Estimate(price=price, model=model, provider=provider, batch=batch)
+    est = Estimate(price=price, model=model, provider=provider, batch=batch, batch_reading=batch_reading)
     sized = _stand_ins(bible)
     person = bible.narration or "third"
     in_chars = reply_chars = 0
@@ -360,6 +370,7 @@ def estimate(chapters: list, lang: str, bible, price: Price | None, *, analyse: 
         in_chars += len(ml.ANALYSE_SYSTEM) + len(prompt)
         reply_chars += int(len(text) * ANALYSE_REPLY_SHARE)
         est.analyse_calls += 1
+    read_in, read_reply = in_chars, reply_chars
     method = method or os.environ.get("FOLIVOX_MARKUP_METHOD", "parts")
     by_parts = method == "parts" and not expression_tags
     others = ml.other_languages(chapters, lang) if by_parts and annotate else []
@@ -401,6 +412,9 @@ def estimate(chapters: list, lang: str, bible, price: Price | None, *, analyse: 
     est.mark_input_tokens = math.ceil(mark_in / CHARS_PER_TOKEN)
     est.mark_output_tokens = math.ceil(mark_reply / CHARS_PER_TOKEN * THINKING_LIKELY)
     est.mark_output_tokens_max = math.ceil(mark_reply / CHARS_PER_TOKEN * THINKING_MAX)
+    est.read_input_tokens = math.ceil(read_in / CHARS_PER_TOKEN)
+    est.read_output_tokens = math.ceil(read_reply / CHARS_PER_TOKEN * THINKING_LIKELY)
+    est.read_output_tokens_max = math.ceil(read_reply / CHARS_PER_TOKEN * THINKING_MAX)
     return est
 
 
@@ -417,5 +431,8 @@ def describe(e: Estimate) -> str:
                 f"shown: set price_in and price_out (USD per million tokens) in [llm.{e.provider or '<provider>'}] in "
                 "config.toml.")
     src = "your config prices" if e.price.source == "config" else f"approximate list prices read {PRICES_READ}"
-    batch = " The marking calls go through Message Batches, at half price." if e.batch else ""
+    batch = {(True, False): " The marking calls go through Message Batches, at half price.",
+             (True, True): " The reading and marking calls go through Message Batches, at half price.",
+             (False, True): " The reading calls go through Message Batches, at half price."}.get(
+                 (e.batch, e.batch_reading), "")
     return f"{calls}, {tokens}: ≈ ${e.usd:.2f} (up to ${e.usd_max:.2f}). {src[0].upper() + src[1:]}.{batch}"

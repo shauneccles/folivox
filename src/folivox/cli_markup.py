@@ -404,10 +404,14 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
                                                       "spend passes N USD."),
                 batch: bool = typer.Option(False, "--batch", help="Mark through Message Batches at half price "
                                            "(--llm anthropic): rounds of minutes each instead of one call at a "
-                                           "time; the reading pass stays as it is."),
+                                           "time; the reading pass stays as it is unless --batch-reading."),
                 strands: int = typer.Option(20, "--batch-strands", min=1, help="With --batch: the windows are cut "
                                             "into N strands of consecutive windows, one window of each per round "
-                                            "(1 asks exactly what a run without --batch asks).")):
+                                            "(1 asks exactly what a run without --batch asks)."),
+                read_strands: int = typer.Option(0, "--batch-reading", min=0, help="With --batch: read the book "
+                                                 "through Message Batches too, in N strands that each build their "
+                                                 "own character list, merged before marking (0: read it one call "
+                                                 "at a time).")):
     from folivox import cli
     from folivox import markup as mk
     from folivox import markup_cost as mc
@@ -425,7 +429,7 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
         extra = 8 + round(0.02 * sum(len(w.blocks) for w in marked)) if best else 0  # as the studio counts them
         return mc.estimate(chs, book.lang, bible, price, analyse=mc.analyse_windows(chs, bible) if reread else [],
                            annotate=marked, extra_calls=extra, expression_tags=expression, model=name,
-                           provider=provider, batch=batch)
+                           provider=provider, batch=batch, batch_reading=bool(batch and read_strands))
 
     if estimate:
         try:
@@ -452,7 +456,8 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
             _show_estimate(run_estimate(bible, model_name, budget.price), max_cost)
         if bible.sampled or bible.done_windows < max(bible.total_windows, 1):  # a preview is not a full reading
             console.print("Reading the book for its characters first…")
-            bible = ml.analyse(chs, book.lang, runner, bible, save=lambda b: b.save(bp), progress=_progress())
+            bible = ml.analyse(chs, book.lang, runner, bible, save=lambda b: b.save(bp), progress=_progress(),
+                               strands=read_strands if batch else 0)
         if best:
             console.print("Looking at the characters again…")
             ml.consolidate(chs, book.lang, bible, runner, save=lambda b: b.save(bp), progress=_progress())

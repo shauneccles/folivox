@@ -192,9 +192,13 @@ Message Batches, which bill every token at half price but answer in minutes, not
 one batch and takes the answers in order, exactly as the one-at-a-time run does, so a character found in one strand
 is known to the next round of all of them. Each strand keeps its own context (the speakers of its previous
 window); a strand that starts mid-book is shown the paragraphs before it, without speakers. `--batch-strands 1`
-asks exactly what a run without `--batch` asks. The reading pass is unchanged. Replies go to the same cache, a batch
-still running when a run is stopped is collected by the next run, an errored or expired request is asked again on
-its own, and `--estimate` and `--max-cost` count the marking calls at the batch price.
+asks exactly what a run without `--batch` asks. `--batch-reading N` reads the book through batches too: the windows
+are cut into N strands (fewer and longer than for marking, as each strand builds its own character list as it
+goes), and once every strand is read their lists are merged, a character found under one of its names in another
+list counting as the same person (the consolidate pass of `--best` then joins the names that are one person).
+Replies go to the same cache, a batch still running when a run is stopped is collected by the next run, an errored
+or expired request is asked again on its own, and `--estimate` and `--max-cost` count the batched calls at the batch
+price.
 
 **Memory of the book ("bible").** `analyse` goes through the book in windows of about 5000 characters. For each
 window the model gets the characters found so far (name, nicknames, gender, age and manner of speech of those named
