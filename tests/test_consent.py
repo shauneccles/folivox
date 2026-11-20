@@ -3,7 +3,9 @@
 A local patch carried by the homelab repository (ansible/files/am5/folivox/patches), not upstream Folivox.
 """
 
+import json
 import shutil
+import subprocess
 import types
 import wave
 
@@ -158,3 +160,27 @@ def test_render_reads_public_speaker_with_cosyvoice3(tmp_path, monkeypatch):
     out = render(book, options(tmp_path, "cosyvoice3", write_wav(tmp_path / "main.wav"), markup=markup))
     assert out.exists()
 
+
+def comment(m4b):
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags=comment", "-of", "json", str(m4b)],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["format"].get("tags", {}).get("comment", "")
+
+
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffmpeg is needed to build the audiobook")
+def test_fish_render_carries_attribution(tmp_path, local_fish):
+    from folivox.tts.licences import ATTRIBUTION
+
+    fish = render(make_book("A short book."), options(tmp_path / "fish", "fish-drama3", write_wav(tmp_path / "m.wav")))
+    cosy = render(make_book("A short book."), options(tmp_path / "cosy", "cosyvoice3", write_wav(tmp_path / "m.wav")))
+    assert comment(fish).startswith("A short book.") and comment(fish).endswith(ATTRIBUTION)
+    assert comment(cosy) == "A short book."
+
+
+def test_attribution_survives_a_long_description():
+    from folivox.tts.licences import ATTRIBUTION
+
+    long = pipeline.attributed("x" * 1200, "fish")
+    assert long.endswith(ATTRIBUTION) and len(long) <= pipeline.COMMENT_LIMIT
+    assert pipeline.attributed("", "fish-s2") == ATTRIBUTION
+    assert pipeline.attributed("A book.", "cosyvoice3") == "A book."
