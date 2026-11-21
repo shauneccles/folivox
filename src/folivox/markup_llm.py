@@ -20,13 +20,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
 import time
 import unicodedata
 import urllib.error
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +51,15 @@ Progress = Callable[[str, int, int, str], None]  # stage, done, total, message
 
 class LLMError(RuntimeError):
     pass
+
+
+class BatchSubmitUnknown(ConnectionError):
+    """Sending a Message Batch ended without an answer (a dropped connection, a time-out, a server error), so it may
+    have been created all the same: look for it before sending the same requests again."""
+
+
+class BatchGone(LLMError):
+    """The provider no longer has this Message Batch or its results (it keeps them 29 days)."""
 
 
 class CostCapReached(LLMError):
@@ -337,12 +348,25 @@ class Cache:
     """Model replies by hash of (model, prompt version, prompts): an interrupted run continues where it stopped
     and an unchanged window is never asked twice."""
 
-    def __init__(self, path: Path | None):
+    def __init__(self, path: Path | None, lock: BookLock | None = None):
+        self.lock = lock  # the book's lock (open_cache): held while this cache is open, released by close()
         self.db = sqlite3.connect(str(path) if path else ":memory:")
         self.db.execute("CREATE TABLE IF NOT EXISTS replies (key TEXT PRIMARY KEY, reply TEXT NOT NULL)")
         # requests sent in a Message Batch whose results have not been collected yet: a run stopped while it waited
         # collects them next time instead of paying for them twice
         self.db.execute("CREATE TABLE IF NOT EXISTS batches (key TEXT PRIMARY KEY, batch TEXT NOT NULL)")
+        # written (and committed) before a batch is sent: a send whose answer was lost is found again by its size and
+        # time (group, see Runner._settle) instead of being paid for twice
+        self.db.execute("CREATE TABLE IF NOT EXISTS sending "
+                        "(key TEXT PRIMARY KEY, grp TEXT NOT NULL, at REAL NOT NULL)")
+        # when each batch this file knows was sent; kept after it is collected, so a known batch is never adopted again
+        self.db.execute("CREATE TABLE IF NOT EXISTS batch_sent (batch TEXT PRIMARY KEY, at REAL NOT NULL)")
+        # a batch found for a cut-off send, waited for on trial: it is the send's only if its results answer exactly the
+        # send's keys (another book may have sent as many requests at the same time)
+        self.db.execute("CREATE TABLE IF NOT EXISTS trial "
+                        "(grp TEXT PRIMARY KEY, batch TEXT NOT NULL, at REAL NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS rejected (grp TEXT NOT NULL, batch TEXT NOT NULL, "
+                        "PRIMARY KEY (grp, batch))")
 
     def get(self, key: str) -> str | None:
         row = self.db.execute("SELECT reply FROM replies WHERE key = ?", (key,)).fetchone()
@@ -364,8 +388,171 @@ class Cache:
         self.db.execute("DELETE FROM batches WHERE batch = ?", (batch,))
         self.db.commit()
 
+    def begin_send(self, keys: list[str], at: float) -> str:
+        """Write ahead of sending a batch of ``keys``: the group id the send is known by until it has a batch id."""
+        grp = uuid.uuid4().hex
+        self.db.executemany("INSERT OR REPLACE INTO sending VALUES (?, ?, ?)", [(k, grp, at) for k in keys])
+        self.db.commit()
+        return grp
+
+    def sent(self, grp: str, batch: str, at: float) -> None:
+        """The group was sent as ``batch`` (at ``at``): its keys wait for that batch, in one transaction."""
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO batches SELECT key, ? FROM sending WHERE grp = ?", (batch, grp))
+            self.db.execute("INSERT OR REPLACE INTO batch_sent VALUES (?, ?)", (batch, at))
+            for table in ("sending", "trial", "rejected"):
+                self.db.execute(f"DELETE FROM {table} WHERE grp = ?", (grp,))
+
+    def drop_send(self, grp: str) -> None:
+        """The group was not sent (refused, or not found after the grace): its keys are asked afresh."""
+        with self.db:
+            for table in ("sending", "trial", "rejected"):
+                self.db.execute(f"DELETE FROM {table} WHERE grp = ?", (grp,))
+
+    def adopt(self, grp: str, batch: str, at: float) -> None:
+        """On trial: the group's keys wait for ``batch`` (created at ``at``) and the group stays until its results
+        prove it (:meth:`sent`) or not (:meth:`reject`)."""
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO batches SELECT key, ? FROM sending WHERE grp = ?", (batch, grp))
+            self.db.execute("INSERT OR REPLACE INTO trial VALUES (?, ?, ?)", (grp, batch, at))
+
+    def reject(self, grp: str, batch: str) -> None:
+        """``batch`` is not the group's: never tried for it again, and nothing waits for it here."""
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO rejected VALUES (?, ?)", (grp, batch))
+            self.db.execute("DELETE FROM trial WHERE grp = ? AND batch = ?", (grp, batch))
+            self.db.execute("DELETE FROM batches WHERE batch = ?", (batch,))
+
+    def on_trial(self, batch: str) -> tuple[str, float] | None:
+        """``(group, created at)`` when ``batch`` waits on trial for a group."""
+        row = self.db.execute("SELECT grp, at FROM trial WHERE batch = ?", (batch,)).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def trying(self, grp: str) -> bool:
+        return bool(self.db.execute("SELECT 1 FROM trial WHERE grp = ?", (grp,)).fetchone())
+
+    def rejected(self, grp: str) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT batch FROM rejected WHERE grp = ?", (grp,))}
+
+    def group_keys(self, grp: str) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT key FROM sending WHERE grp = ?", (grp,))}
+
+    def sending(self, keys: list[str] | None = None) -> dict[str, tuple[float, list[str]]]:
+        """``{group: (when, every key of the group)}`` of the sends not known to have reached the provider, all of
+        them or those holding one of ``keys``."""
+        rows = self.db.execute("SELECT key, grp, at FROM sending").fetchall()
+        groups: dict[str, tuple[float, list[str]]] = {}
+        for key, grp, at in rows:
+            groups.setdefault(grp, (at, []))[1].append(key)
+        if keys is not None:
+            want = set(keys)
+            groups = {g: v for g, v in groups.items() if want.intersection(v[1])}
+        return groups
+
+    def known(self, batch: str) -> bool:
+        return bool(self.db.execute("SELECT 1 FROM batch_sent WHERE batch = ? UNION SELECT 1 FROM batches WHERE "
+                                    "batch = ?", (batch, batch)).fetchone())
+
+    def pending_batches(self, now: float) -> list[tuple[str, int, float]]:
+        """``(batch id, requests, sent at)`` of every batch not collected yet, oldest first; one sent before this file
+        kept send times counts from ``now``."""
+        rows = self.db.execute("SELECT batch, COUNT(*) FROM batches GROUP BY batch").fetchall()
+        out = []
+        for batch, n in rows:
+            row = (self.db.execute("SELECT at FROM batch_sent WHERE batch = ?", (batch,)).fetchone()
+                   or self.db.execute("SELECT at FROM trial WHERE batch = ?", (batch,)).fetchone())
+            if row is None:
+                self.db.execute("INSERT INTO batch_sent VALUES (?, ?)", (batch, now))
+                self.db.commit()
+            out.append((batch, n, row[0] if row else now))
+        return sorted(out, key=lambda b: b[2])
+
     def close(self) -> None:
-        self.db.close()
+        try:
+            self.db.close()
+        finally:
+            if self.lock is not None:
+                self.lock.release()
+
+
+class BookLock:
+    """One writer at a time for a book's cache file, across processes (the CLI's runs and ``markup collect``, the
+    studio's runs and its sweep): an OS lock on ``<cache file>.lock`` (flock on POSIX, msvcrt.locking on Windows),
+    which the system drops when its holder dies."""
+
+    def __init__(self, cache_file: Path):
+        self.path = Path(f"{cache_file}.lock")
+        self._fh = None
+
+    def try_acquire(self) -> bool:
+        if self._fh is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+b")  # noqa: SIM115 — held open as long as the lock
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self._fh = fh
+        return True
+
+    def acquire(self, cancelled: Callable[[], bool] = lambda: False, waiting: Callable[[], None] | None = None,
+                timeout: float | None = None, poll: float = 0.25) -> bool:
+        """Wait for the lock (``waiting`` is called once if it is held); False when cancelled or past ``timeout``."""
+        start, told = time.monotonic(), False
+        while not self.try_acquire():
+            if cancelled() or (timeout is not None and time.monotonic() - start >= timeout):
+                return False
+            if waiting is not None and not told:
+                waiting()
+                told = True
+            time.sleep(poll)
+        return True
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            fh.close()
+
+
+def open_cache(path: Path, *, cancelled: Callable[[], bool] = lambda: False,
+               waiting: Callable[[], None] | None = None, fresh: bool = False) -> Cache | None:
+    """A run's cache file, opened once the book's lock (:class:`BookLock`) is held: a sweep or another run of the
+    same book is waited for (``waiting`` is told). The lock is released by :meth:`Cache.close`. None when cancelled
+    while waiting. ``fresh``: forget the saved replies first."""
+    lock = BookLock(path)
+    if not lock.acquire(cancelled=cancelled, waiting=waiting):
+        return None
+    try:
+        if fresh:
+            Path(path).unlink(missing_ok=True)
+        return Cache(path, lock=lock)
+    except BaseException:
+        lock.release()
+        raise
 
 
 def extract_json(text: str) -> dict:
@@ -392,9 +579,9 @@ class Runner:
 
     def __init__(self, llm, model: str, cache: Cache, tries: int = 2,
                  cancelled: Callable[[], bool] = lambda: False, sleep: Callable[[float], None] = time.sleep,
-                 budget=None):
+                 budget=None, clock: Callable[[], float] = time.time):
         self.llm, self.model, self.cache, self.tries = llm, model, cache, tries
-        self.cancelled, self.sleep = cancelled, sleep
+        self.cancelled, self.sleep, self.clock = cancelled, sleep, clock
         self.budget = budget  # folivox.markup_cost.Budget: counts what the calls cost and stops at a spending cap
         self.calls = self.cached = self.failures = 0
 
@@ -457,24 +644,25 @@ class Runner:
         not give (errored, expired, unusable, short) is asked again on its own with :meth:`ask`, once every usable
         answer of the batch is in the cache; a short answer (:class:`ShortReply`) stands when the retries do no
         better. None when the run was cancelled while the batch ran: its id stays in the cache file and the next run
-        collects it."""
+        (or a sweep, :func:`collect_batches`) collects it."""
         keys = [self.key(it[0], it[1]) for it in items]
         out: list = [None] * len(items)
         todo = []
+        seen: dict[str, str | None] = {}  # what the cache held for each key asked (_batch looks again before sending)
         for i, ((_s, _p, validate, *_), key) in enumerate(zip(items, keys, strict=True)):
-            hit = self.cache.get(key)
+            hit = seen[key] = self.cache.get(key)
             if hit is not None:
                 try:
                     out[i] = validate(extract_json(hit))
                     self.cached += 1
                     continue
-                except ValueError:
+                except (ValueError, KeyError, TypeError, AttributeError):  # a batch reply is stored unchecked
                     pass
             todo.append(i)
         if not todo:
             return out
         replies = self._batch([(keys[i], *items[i][:2], items[i][3] if len(items[i]) > 3 else None) for i in todo],
-                              waiting)
+                              waiting, seen)
         if replies is None:
             return None
         again: dict[int, ShortReply | None] = {}  # asked again on its own, with the batch's short answer if it gave one
@@ -501,51 +689,109 @@ class Runner:
                 out[i] = short if short is not None else e
         return out
 
-    def _batch(self, reqs: list[tuple[str, str, str, dict | None]], waiting) -> dict | None:
+    def _settle(self, keys: list[str], waiting) -> bool:
+        """Decide every send of a batch holding one of ``keys`` that ended without an answer (:func:`reconcile`):
+        found, it is waited for like any batch; not found after the grace, its keys are sent again. Waits while it
+        cannot tell; False when the run was cancelled meanwhile."""
+        while True:
+            groups = self.cache.sending(keys)
+            if not groups or not reconcile(self.cache, self.llm, groups, self.clock()):
+                return True
+            if self.cancelled():
+                return False
+            if waiting:
+                waiting("looking for a batch whose sending was cut off")
+            self._wait(self.BATCH_POLL)
+            if self.cancelled():
+                return False
+
+    def _batch(self, reqs: list[tuple[str, str, str, dict | None]], waiting,
+               seen: dict[str, str | None] | None = None) -> dict | None:
         """Raw replies (or exceptions) by key for ``(key, system, prompt, schema)``: from a batch sent earlier and still
-        uncollected, else from a new one. Every billed reply is counted at the batch price."""
+        uncollected, else from a new one. Every billed reply is counted at the batch price.
+
+        The keys are written to the cache before the batch is sent and given its id in the same transaction that
+        drops them, so a send whose answer is lost is found again (:meth:`_settle`) rather than sent twice. Right
+        before sending, the cache is read again: a reply stored since ``seen`` (what the caller read) is used, not
+        asked for again."""
+        seen = seen or {}
         sent = {key: len(system) + len(prompt) for key, system, prompt, _ in reqs}
-        pending: dict[str, list[str]] = {}
-        new = []
-        for key, system, prompt, schema in reqs:
-            bid = self.cache.pending(key)
-            if bid:
-                pending.setdefault(bid, []).append(key)
-            else:
-                new.append((key, system, prompt, schema))
-        if new:
-            if self.budget is not None:
-                self.budget.check(sum(sent[k] for k, *_ in new), calls=len(new), batch=True)
-            bid = self.llm.batch_submit([(key, prompt, system, schema) for key, system, prompt, schema in new])
-            self.cache.set_pending([k for k, *_ in new], bid)
-            self.calls += len(new)
-            pending[bid] = [k for k, *_ in new]
         replies: dict = {}
-        for bid in pending:
-            while True:
+        while True:
+            if not self._settle([k for k in sent if k not in replies], waiting):
+                return None
+            pending: dict[str, list[str]] = {}
+            new = []
+            for key, system, prompt, schema in reqs:
+                if key in replies:
+                    continue
+                bid = self.cache.pending(key)
+                if bid:
+                    pending.setdefault(bid, []).append(key)
+                else:
+                    new.append((key, system, prompt, schema))
+            if new and self.budget is not None:
+                self.budget.check(sum(sent[k] for k, *_ in new), calls=len(new), batch=True)
+            for req in list(new):  # stored meanwhile (by a sweep, say): never sent again
+                hit = self.cache.get(req[0])
+                if hit is not None and hit != seen.get(req[0]):
+                    replies[req[0]] = hit
+                    new.remove(req)
+            if new:
+                keys = [k for k, *_ in new]
+                grp = self.cache.begin_send(keys, self.clock())
                 try:
-                    status = self.llm.batch_status(bid)
-                except ConnectionError:
-                    status = "unreachable"
-                if status == "ended":
-                    break
-                if self.cancelled():
-                    return None
-                if waiting:
-                    waiting(status)
-                self._wait(self.BATCH_POLL)
-                if self.cancelled():
-                    return None
-            for key, (reply, usage) in self.llm.batch_results(bid).items():
-                if self.budget is not None and (usage or isinstance(reply, str)):
-                    self.budget.record(usage, sent.get(key, 0), len(reply) if isinstance(reply, str) else 0,
-                                       batch=True)
-                if key in sent:
-                    replies[key] = reply
-                elif isinstance(reply, str):  # asked by an earlier run in another state: kept for a later window
-                    self.cache.put(key, reply)
-            self.cache.collected(bid)
-        return replies
+                    bid = self.llm.batch_submit([(key, prompt, system, schema) for key, system, prompt, schema in new])
+                except BatchSubmitUnknown:  # perhaps created: the write-ahead stays and the next look settles it
+                    self.calls += len(new)
+                    continue
+                except Exception:  # refused: nothing to look for
+                    self.cache.drop_send(grp)
+                    raise
+                self.cache.sent(grp, bid, self.clock())
+                self.calls += len(new)
+                pending[bid] = keys
+            again = False  # a batch adopted on trial proved to be another's: its keys are settled again
+            for bid in pending:
+                try:
+                    while True:
+                        try:
+                            status = self.llm.batch_status(bid)
+                        except ConnectionError:
+                            status = "unreachable"
+                        if status == "ended":
+                            break
+                        if self.cancelled():
+                            return None
+                        if waiting:
+                            waiting(status)
+                        self._wait(self.BATCH_POLL)
+                        if self.cancelled():
+                            return None
+                    results = self.llm.batch_results(bid)
+                except BatchGone as e:
+                    trial = self.cache.on_trial(bid)
+                    if trial is not None:
+                        self.cache.reject(trial[0], bid)
+                        again = True
+                    else:  # its answers are asked again on their own
+                        _log(logging.ERROR, f"markup batch lost: {bid}: {e}")
+                        self.cache.collected(bid)
+                    continue
+                if not prove(self.cache, bid, results):
+                    again = True
+                    continue
+                for key, (reply, usage) in results.items():
+                    if self.budget is not None and (usage or isinstance(reply, str)):
+                        self.budget.record(usage, sent.get(key, 0), len(reply) if isinstance(reply, str) else 0,
+                                           batch=True)
+                    if key in sent:
+                        replies[key] = reply
+                    elif isinstance(reply, str):  # asked by an earlier run in another state: kept for a later window
+                        self.cache.put(key, reply)
+                self.cache.collected(bid)
+            if not again:
+                return replies
 
     def ask(self, system: str, prompt: str, validate: Callable[[dict], dict], schema: dict | None = None) -> dict:
         """Reply parsed and checked by ``validate`` (which raises ValueError on a bad one). ``schema``: the JSON shape
@@ -557,7 +803,7 @@ class Runner:
                 out = validate(extract_json(hit))
                 self.cached += 1
                 return out
-            except ValueError:
+            except (ValueError, KeyError, TypeError, AttributeError):  # a batch reply is stored unchecked
                 pass
         last: Exception | None = None
         best: ShortReply | None = None  # the most complete of the short replies, never cached
@@ -599,6 +845,206 @@ class Runner:
         if best is not None:
             raise best
         raise ValueError(f"no usable answer after {self.tries} tries: {last}")
+
+
+# -- Message Batches no run is waiting for ------------------------------------------------------------------------
+
+RECONCILE_GRACE = 600.0  # seconds after a send that ended without an answer before it is taken as never created
+RECONCILE_SLACK = 120.0  # a batch created up to this long before the write-ahead (clocks differ) may still be it
+BATCH_WARN_DAYS = 14  # a batch still uncollected this long after it was sent is reported on every sweep
+
+
+def _log(level: int, msg: str) -> None:
+    from folivox import diag
+
+    diag.event(msg, level)
+
+
+def reconcile(cache: Cache, llm, groups: dict[str, tuple[float, list[str]]], now: float) -> list[str]:
+    """Settle sends of a batch that ended without an answer (``groups`` from :meth:`Cache.sending`); the groups
+    still open come back. A group's batch is looked for among the batches created since shortly before the group was
+    written with as many requests, not known to this cache and not already rejected for it, the one created closest to
+    the send first. It is adopted on trial (:meth:`Cache.adopt`): its keys wait for it like any batch, and its results
+    decide (:func:`prove`). With no such batch left more than :data:`RECONCILE_GRACE` after the send, it was never
+    created: the keys are sent again. A group waiting on trial is not open here: its batch is waited for.
+
+    Another book's batch of the same size, adopted on trial, costs nothing: the custom ids are hashes of the
+    requests, so its replies are kept in the cache as replies asked by an earlier run, and it is rejected for the
+    group, which is looked for again without it."""
+    groups = {g: v for g, v in groups.items() if not cache.trying(g)}
+    if not groups:
+        return []
+    try:
+        found = llm.batch_list(min(at for at, _ in groups.values()) - RECONCILE_SLACK)
+    except ConnectionError:  # cannot tell: nothing is decided
+        return list(groups)
+    taken: set[str] = set()
+    still = []
+    for grp, (at, keys) in sorted(groups.items(), key=lambda g: g[1][0]):
+        rejected = cache.rejected(grp)
+        fits = [b for b in found if b[1] >= at - RECONCILE_SLACK and b[2] == len(keys) and b[0] not in taken
+                and b[0] not in rejected and not cache.known(b[0])]
+        if fits:
+            match = min(fits, key=lambda b: abs(b[1] - at))
+            taken.add(match[0])
+            cache.adopt(grp, match[0], match[1])
+        elif now - at > RECONCILE_GRACE:
+            cache.drop_send(grp)
+        else:
+            still.append(grp)
+    return still
+
+
+def prove(cache: Cache, batch: str, results: dict) -> bool:
+    """Whether an ended batch's ``results`` may be taken as this cache's. A batch on trial (:func:`reconcile`) is
+    its group's only when it answers exactly the group's keys: then the group is sent as that batch. Otherwise its
+    text replies are kept under their keys (harmless: the keys are hashes of the requests) and it is rejected for the
+    group. A batch not on trial is this cache's own."""
+    trial = cache.on_trial(batch)
+    if trial is None:
+        return True
+    grp, at = trial
+    if set(results) == cache.group_keys(grp):
+        cache.sent(grp, batch, at)
+        return True
+    for key, (reply, _usage) in results.items():
+        if isinstance(reply, str):
+            cache.put(key, reply)
+    cache.reject(grp, batch)
+    return False
+
+
+@dataclass
+class Sweep:
+    """What :func:`collect_batches` did: batches collected, still waiting (running, or not reachable now) and lost
+    (the provider no longer has them); replies kept and what they cost (USD, estimated; None without a price); books
+    skipped because a run held them (:func:`sweep`)."""
+
+    collected: int = 0
+    waiting: int = 0
+    lost: int = 0
+    replies: int = 0
+    usd: float | None = 0.0
+    skipped: int = 0
+
+    def add(self, other: Sweep) -> None:
+        self.collected += other.collected
+        self.waiting += other.waiting
+        self.lost += other.lost
+        self.replies += other.replies
+        self.skipped += other.skipped
+        self.usd = None if self.usd is None or other.usd is None else self.usd + other.usd
+
+
+def collect_batches(path: Path, llm, log: Callable[[int, str], None] = _log, *, book: str | None = None, price=None,
+                    clock: Callable[[], float] = time.time) -> Sweep:
+    """Collect the Message Batches of one cache file without a run (the caller holds the book's lock, as
+    :func:`sweep` does): settle its cut-off sends (:func:`reconcile`), then for every batch not collected yet, keep
+    each text reply of an ended one under its key and only then cross it off (a crash in between downloads it again).
+    A batch adopted on trial that proves to be another's (:func:`prove`) is rejected and the send looked for again.
+    A batch the provider no longer has is crossed off and logged at ERROR; one still uncollected
+    :data:`BATCH_WARN_DAYS` after it was sent is logged at WARNING every time. ``book``: the name the log lines give
+    (default: from the file name); ``price`` (:class:`folivox.markup_cost.Price`) estimates what the kept replies
+    cost, at the batch price."""
+    from folivox import markup_cost as mc
+
+    name = book or Path(path).name.removesuffix(".llm-cache.sqlite")
+    out, spent, trouble = Sweep(), mc.Usage(), ""
+    cache = Cache(Path(path))
+    try:
+        now = clock()
+        looked: set[str] = set()
+        for _ in range(20):  # a rejected trial batch sends the search round again, without it
+            again = False
+            try:
+                open_groups = len(reconcile(cache, llm, cache.sending(), now))
+            except LLMError as e:
+                open_groups, trouble = len(cache.sending()), str(e)
+            for bid, n, at in cache.pending_batches(now):
+                if bid in looked:
+                    continue
+                looked.add(bid)
+                days = int((now - at) // 86400)
+                try:
+                    status = llm.batch_status(bid)
+                    results = llm.batch_results(bid) if status == "ended" else None
+                except BatchGone as e:
+                    trial = cache.on_trial(bid)
+                    if trial is not None:  # it was not this book's to lose
+                        cache.reject(trial[0], bid)
+                        again = True
+                        continue
+                    log(logging.ERROR, f"markup batch lost: {bid}, {n} requests, {days} days old, {name}: {e}")
+                    cache.collected(bid)
+                    out.lost += 1
+                    continue
+                except (ConnectionError, LLMError) as e:
+                    results, trouble = None, str(e)
+                if results is None:
+                    out.waiting += 1
+                    if now - at > BATCH_WARN_DAYS * 86400:
+                        log(logging.WARNING, f"markup batch uncollected: {bid}, {n} requests, {days} days old, {name}")
+                    continue
+                if not prove(cache, bid, results):  # another's: its replies are kept, the send looked for again
+                    again = True
+                    continue
+                for key, (reply, usage) in results.items():
+                    if isinstance(reply, str):
+                        cache.put(key, reply)
+                        out.replies += 1
+                    if usage:
+                        spent.add(usage)
+                cache.collected(bid)
+                out.collected += 1
+            if not again:
+                break
+        out.waiting += open_groups
+    finally:
+        cache.close()
+    if trouble:
+        log(logging.WARNING, f"markup batches of {name} could not all be checked: {trouble}")
+    out.usd = price.usd(spent) * mc.BATCH_PRICE if price is not None else None
+    return out
+
+
+def has_uncollected(path: Path) -> bool:
+    """Whether a cache file holds batches not collected yet or sends not settled, read without changing it."""
+    try:
+        db = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        return any(db.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone() for t in ("batches", "sending") if t in tables)
+    except sqlite3.Error:
+        return False
+    finally:
+        db.close()
+
+
+def sweep(books: Iterable[tuple[Path, str]], llm, log: Callable[[int, str], None] = _log, *, price=None,
+          clock: Callable[[], float] = time.time, wait: float = 0.0) -> Sweep:
+    """:func:`collect_batches` over ``(cache file, book name)`` pairs, each under the book's lock (:class:`BookLock`):
+    a book a run holds for longer than ``wait`` seconds is skipped (that run collects its own batches) and logged.
+    Then one INFO line with the counts (and one with what the kept replies cost, which no run's spending cap counts)."""
+    total = Sweep()
+    for path, name in books:
+        lock = BookLock(path)
+        if not lock.acquire(timeout=wait):
+            log(logging.INFO, f"markup batches of {name} skipped: a markup run is working on this book")
+            total.skipped += 1
+            continue
+        try:
+            total.add(collect_batches(path, llm, log, book=name, price=price, clock=clock))
+        except Exception as e:  # noqa: BLE001 — one unreadable file must not stop the others
+            log(logging.ERROR, f"markup batches of {name} could not be swept: {e}")
+        finally:
+            lock.release()
+    log(logging.INFO, f"markup batches swept: {total.collected} collected, {total.waiting} waiting, {total.lost} lost")
+    if total.replies:
+        cost = f"≈ ${total.usd:.4f} at the batch price" if total.usd is not None else "price not known"
+        log(logging.INFO, f"markup batch replies kept: {total.replies}, {cost}, outside any run's spending cap")
+    return total
 
 
 # -- windows --------------------------------------------------------------------------------------------------

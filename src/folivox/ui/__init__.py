@@ -321,6 +321,7 @@ def run(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True, re
     if open_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     app.state.watchdog.start()
+    app.state.batch_sweeper.start()  # in the background: the studio does not wait for it
     try:
         server.run()
     finally:

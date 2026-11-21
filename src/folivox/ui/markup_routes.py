@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import shutil
 import threading
 import time
@@ -70,6 +71,72 @@ def has_batches(provider: str) -> bool:
     except (ImportError, AttributeError, ValueError, RuntimeError):
         return False
     return bool(getattr(factory, "batches", False))
+
+
+SWEEP_EVERY = 24 * 3600.0  # seconds between two sweeps of the Message Batches no run is waiting for
+
+
+class BatchSweeper:
+    """Collects the Message Batches no run is waiting for (:func:`folivox.markup_llm.sweep`): once when the studio
+    starts, then every :data:`SWEEP_EVERY`, and only when the anthropic provider can be made (it has its key). A book
+    whose markup is running now is left to that run, which collects its own batches: the run holds the book's lock
+    (:class:`folivox.markup_llm.BookLock`, one writer per cache file) and the sweep skips a book it cannot lock.
+    What a sweep collects is logged with its estimated cost and counted against no run's spending cap."""
+
+    def __init__(self, state, services: dict | None = None, every: float = SWEEP_EVERY,
+                 say=lambda line: print(line, flush=True)):
+        self.state, self.services, self.every, self.say = state, services or {}, every, say
+        self._stop = threading.Event()
+
+    def _llm(self):
+        try:
+            llm = self.services["llm"]("anthropic") if "llm" in self.services else ml.make_llm("anthropic")[0]
+        except Exception:  # noqa: BLE001 — no key, no anthropic package: nothing to sweep with
+            return None
+        return llm if getattr(llm, "batches", False) else None
+
+    def books(self):
+        """``(cache file, book file name)`` of each book with batches to collect. A book whose markup is running is
+        skipped by :func:`folivox.markup_llm.sweep`: the run holds the book's lock."""
+        d = self.state.data_dir / "llm-cache"
+        for f in sorted(d.glob("*.sqlite")) if d.is_dir() else []:
+            if not ml.has_uncollected(f):
+                continue
+            folder = self.state.data_dir / "uploads" / f.stem
+            names = sorted(p.name for p in folder.iterdir() if p.is_file()) if folder.is_dir() else []
+            yield f, names[0] if names else f.stem
+
+    def log(self, level: int, msg: str) -> None:
+        ml._log(level, msg)
+        self.say(f"folivox {logging.getLevelName(level)}: {msg}")
+
+    def sweep_once(self) -> ml.Sweep | None:
+        """One sweep; None when there is no provider to sweep with."""
+        from folivox import markup_cost as mc
+
+        llm = self._llm()
+        if llm is None:
+            return None
+        try:
+            price = mc.price_of("anthropic", getattr(llm, "model", ""))
+        except ValueError:
+            price = None
+        return ml.sweep(self.books(), llm, self.log, price=price)
+
+    def start(self) -> None:
+        def loop() -> None:
+            while True:
+                try:
+                    self.sweep_once()
+                except Exception as e:  # noqa: BLE001 — the next sweep tries again
+                    self.log(logging.ERROR, f"markup batch sweep failed: {e}")
+                if self._stop.wait(self.every):
+                    return
+
+        threading.Thread(target=loop, daemon=True, name="folivox-batch-sweep").start()
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 def unload(t: Task) -> None:
@@ -406,10 +473,22 @@ def routes(api_error, state, services: dict) -> list[Route]:
             finally:
                 unload(t)
 
+        def open_cache():
+            """The book's cache, once no sweep or other run holds it; None (the task cancelled) if stopped first."""
+            cache = ml.open_cache(cp, cancelled=t.cancel.is_set,
+                                  waiting=lambda: progress("waiting", 0, 0, "waiting for the batch collection of "
+                                                           "this book to finish"))
+            if cache is None:
+                t.state = "cancelled"
+                unload(t)
+            return cache
+
         def work_mode() -> None:
             """The two ways the page offers: a preview (a sample, minutes) or the best that can be done (every
             chapter chosen, the whole book read, the characters looked at again, doubtful places asked about again)."""
-            cache = ml.Cache(cp)
+            cache = open_cache()
+            if cache is None:
+                return
             runner = ml.Runner(llm, model, cache, cancelled=t.cancel.is_set, budget=budget)
             try:
                 bible = ml.Bible.load(bp) if bp.is_file() else ml.Bible()
@@ -457,7 +536,9 @@ def routes(api_error, state, services: dict) -> list[Route]:
                 return work_prompts()
             if what in ("preview", "best"):
                 return work_mode()
-            cache = ml.Cache(cp)
+            cache = open_cache()
+            if cache is None:
+                return
             runner = ml.Runner(llm, model, cache, cancelled=t.cancel.is_set, budget=budget)
             try:
                 bible = ml.Bible.load(bp) if bp.is_file() and body.get("resume", True) else ml.Bible()

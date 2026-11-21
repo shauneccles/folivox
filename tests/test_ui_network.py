@@ -366,7 +366,8 @@ def test_run_warns_loudly_and_starts_without_a_token(monkeypatch, capsys):
     monkeypatch.setattr(uvicorn.Server, "run", lambda self: None)
     from types import SimpleNamespace as NS
 
-    fake = NS(state=NS(watchdog=NS(start=lambda: None), shutdown=lambda: None, cancel_all=lambda: None))
+    fake = NS(state=NS(watchdog=NS(start=lambda: None), batch_sweeper=NS(start=lambda: None), shutdown=lambda: None,
+                       cancel_all=lambda: None))
     monkeypatch.setattr("folivox.ui.app.create_app", lambda **kw: seen.update(kw=kw) or fake)
     monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: seen.update(config_kw=k) or object())
     monkeypatch.setattr(uvicorn.Server, "__init__", lambda self, cfg: None)

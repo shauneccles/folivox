@@ -210,6 +210,10 @@ def _llm(provider: str | None, model: str | None):
         raise typer.Exit(2) from None
 
 
+def _waiting_for_book() -> None:
+    console.print("Another markup run or a batch collection is working on this book; waiting for it to finish…")
+
+
 def _provider(llm_name: str | None) -> str:
     from folivox import config
     from folivox.llm import LLMS
@@ -327,7 +331,7 @@ def markup_analyse(book_path: Path = typer.Argument(...), depth: int = typer.Opt
                                    provider=provider), max_cost)
     if bible.model and bible.model != model_name:
         console.print(f"[yellow]The list was made with {bible.model}; continuing with {model_name}.[/]")
-    cache = ml.Cache(cp)
+    cache = ml.open_cache(cp, waiting=_waiting_for_book)
     runner = ml.Runner(llm, model_name, cache, budget=budget)
     console.print(f"Analysing {book.title} with {model_name}…")
     try:
@@ -462,9 +466,7 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
         console.print(f"[red]--batch needs a provider with Message Batches (--llm anthropic), not {provider}.[/]")
         raise typer.Exit(2)
     budget = _budget(provider, model_name, max_cost)
-    if fresh:
-        cp.unlink(missing_ok=True)
-    cache = ml.Cache(cp)
+    cache = ml.open_cache(cp, waiting=_waiting_for_book, fresh=fresh)
     runner = ml.Runner(llm, model_name, cache, budget=budget)
     paid = not (budget.price and budget.price.free)
     try:
@@ -523,6 +525,44 @@ def markup_auto(book_path: Path = typer.Argument(...), depth: int = typer.Option
                       "review list. Run the same command again to ask about them once more.")
     console.print("Check and fix it with `folivox markup export` / `import`, assign voices with "
                   "`folivox markup speaker`.")
+
+
+COLLECT_WAIT = 30.0  # seconds `markup collect` waits for a run of the same book before it gives up
+
+
+@markup_app.command("collect", help="Collect the book's Message Batches that no run is waiting for (a run stopped "
+                    "while one ran, a send cut off) into its saved replies, and say how many are left.")
+def markup_collect(book_path: Path = typer.Argument(...),
+                   llm_name: str = typer.Option("anthropic", "--llm", help="The provider the batches went to.")):
+    import logging
+
+    from rich.markup import escape
+
+    from folivox import markup_cost as mc
+    from folivox import markup_llm as ml
+
+    cp = ml.cache_path(book_path)
+    if not cp.is_file():
+        console.print(f"No saved replies for {book_path.name}: nothing to collect.")
+        return
+    llm, model = _llm(llm_name, None)
+    if not getattr(llm, "batches", False):
+        console.print(f"[red]The {llm_name} provider has no Message Batches.[/]")
+        raise typer.Exit(2)
+    try:
+        price = mc.price_of(_provider(llm_name), model)
+    except ValueError:  # a price in the config that is not a number: the counts matter more than the cost
+        price = None
+
+    def log(level: int, msg: str) -> None:
+        style = "red" if level >= logging.ERROR else "yellow" if level >= logging.WARNING else ""
+        console.print(f"[{style}]{escape(msg)}[/]" if style else escape(msg), soft_wrap=True)
+
+    swept = ml.sweep([(cp, book_path.name)], llm, log, price=price, wait=COLLECT_WAIT)
+    if swept.skipped:
+        console.print("[red]A markup run is working on this book and collects its batches itself; run this again "
+                      "once it has finished.[/]")
+        raise typer.Exit(1)
 
 
 @markup_app.command("voices", help="Write English voice-design prompts for the characters; optionally make takes.")

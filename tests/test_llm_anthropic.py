@@ -37,6 +37,11 @@ class FakeClient:
         self.messages = FakeMessages(self)
         self.beta = SimpleNamespace(messages=FakeMessages(self))
         self.model = FakeLLM()
+        self.options: list[dict] = []  # with_options calls (batch_submit sends without the SDK's retries)
+
+    def with_options(self, **kw):
+        self.options.append(kw)
+        return self
 
     def answer(self, req):
         self.requests.append(req)

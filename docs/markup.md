@@ -204,6 +204,23 @@ Replies go to the same cache, a batch still running when a run is stopped is col
 expired or short answer is asked again on its own, and `--estimate` and `--max-cost` count the batched calls at the
 batch price.
 
+Nothing sent is lost on the way, since a batch is billed once Anthropic creates it. The requests are written to the
+cache before a batch is sent, and the batch's id replaces them in one step once it is known. A send that ends without
+an answer (a dropped connection, a time-out, a server error) is not retried blindly: the run looks for the batch among
+the account's recent batches (one created at about that time with as many requests) and waits for it if it is there.
+It is taken only if its answers are to exactly these requests: another book's batch of the same size is set aside (its
+answers are kept, they do no harm) and the run looks again. If none is left to try ten minutes after the send, it was
+never created and the requests are sent again.
+
+A batch no run waits for any more (the run was stopped, or the book is not marked again) is collected by
+`folivox markup collect BOOK`, which keeps its replies in the cache and says how many batches it collected, how many
+are still running and how many Anthropic no longer has (it keeps results for 29 days). The studio does the same for
+every book when it starts and then once a day, when an Anthropic key is set. A run and a collection never work on the
+same book at once (a lock file beside the book's saved replies): the studio skips a book whose markup is running, a
+run waits for a collection to finish, and `markup collect` waits half a minute for a run, then says it is busy. What
+it collects is logged with its cost and counts against no run's spending cap. A batch still uncollected two weeks after
+it was sent is logged as a warning on every sweep.
+
 **Memory of the book ("bible").** `analyse` goes through the book in windows of about 5000 characters. For each
 window the model gets the characters found so far (name, nicknames, gender, age and manner of speech of those named
 in the window, active in the last windows or the busiest) and reports who speaks, thinks or matters. What it says

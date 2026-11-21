@@ -1865,6 +1865,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
     app.state.ui = state
     app.state.request_exit = None  # set by `folivox ui`: asks uvicorn to stop
     app.state.watchdog = lifecycle.Watchdog(state, presence)
+    app.state.batch_sweeper = markup_routes.BatchSweeper(state, services)  # started with the server (`folivox ui`)
 
     def cancel_all() -> None:
         """Non-blocking: ask every running job to stop (called from the signal handler)."""
@@ -1880,6 +1881,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
     def shutdown() -> None:
         """Stop everything the server started: render children, markup threads (and their model), generation."""
         app.state.watchdog.stop()
+        app.state.batch_sweeper.stop()
         cancel_all()
         state.manager.stop_all()
         end = time.time() + 8

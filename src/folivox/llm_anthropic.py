@@ -127,20 +127,75 @@ class AnthropicLLM(LLM):
     def batch_submit(self, items: list[tuple]) -> str:
         """One Message Batch of ``(custom id, prompt, system[, JSON schema])``, built as single requests are (cache
         breakpoints, thinking, effort); a batch takes no server-side fallbacks, so a refusal there is retried on its
-        own. Returns the batch id."""
+        own. Returns the batch id.
+
+        Sent once, without the SDK's own retries: a dropped connection, a time-out or a server error may follow a
+        batch that was created all the same, so it raises :class:`~folivox.markup_llm.BatchSubmitUnknown` and the
+        caller looks for the batch (:meth:`batch_list`) before sending again. A refusal (4xx) is mapped as usual."""
+        import anthropic
+
+        from folivox.markup_llm import BatchSubmitUnknown
+
         reqs = [{"custom_id": it[0], "params": self._request(it[1], it[2], it[3] if len(it) > 3 else None)}
                 for it in items]
-        return self._call(lambda: self.client.messages.batches.create(requests=reqs)).id
+
+        def create():
+            try:
+                return self.client.with_options(max_retries=0).messages.batches.create(requests=reqs)
+            except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                raise BatchSubmitUnknown(f"Anthropic could not be reached while a batch was sent: {e}") from None
+            except anthropic.APIStatusError as e:
+                if e.status_code >= 500:
+                    raise BatchSubmitUnknown(f"Anthropic did not answer while a batch was sent (HTTP "
+                                             f"{e.status_code}): {e.message}") from None
+                raise
+
+        return self._call(create).id
+
+    def _batch_call(self, fn):
+        """A read of one batch; HTTP 404 means the batch, or its results, are gone (29 days after it was sent)."""
+        import anthropic
+
+        from folivox.markup_llm import BatchGone
+
+        def call():
+            try:
+                return fn()
+            except anthropic.NotFoundError as e:
+                raise BatchGone(f"Anthropic no longer has this batch (HTTP 404): {e.message}") from None
+
+        return self._call(call)
 
     def batch_status(self, batch_id: str) -> str:
         """``in_progress``, ``canceling`` or ``ended``."""
-        return str(self._call(lambda: self.client.messages.batches.retrieve(batch_id)).processing_status)
+        from folivox.markup_llm import BatchGone
+
+        b = self._batch_call(lambda: self.client.messages.batches.retrieve(batch_id))
+        if getattr(b, "archived_at", None) is not None:
+            raise BatchGone(f"Anthropic archived this batch's results on {b.archived_at:%Y-%m-%d}")
+        return str(b.processing_status)
+
+    def batch_list(self, since: float) -> list[tuple[str, float, int, str]]:
+        """``(id, created at (epoch seconds), requests, processing status)`` of the batches created at or after
+        ``since``, newest first (the API lists them so: paging stops at the first older one)."""
+        def look():
+            out = []
+            for b in self.client.messages.batches.list(limit=100):
+                at = b.created_at.timestamp()
+                if at < since:
+                    break
+                c = b.request_counts
+                out.append((b.id, at, c.processing + c.succeeded + c.errored + c.canceled + c.expired,
+                            str(b.processing_status)))
+            return out
+
+        return self._call(look)
 
     def batch_results(self, batch_id: str) -> dict:
         """``{custom id: (reply text or the ValueError it ended with, usage or None)}`` of an ended batch; results
         come in any order. Errored, canceled and expired requests were not billed."""
         out = {}
-        for r in self._call(lambda: list(self.client.messages.batches.results(batch_id))):
+        for r in self._batch_call(lambda: list(self.client.messages.batches.results(batch_id))):
             kind = r.result.type
             if kind == "succeeded":
                 try:
