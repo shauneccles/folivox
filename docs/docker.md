@@ -62,6 +62,7 @@ To build one yourself: `docker build -f docker/Dockerfile --build-arg VARIANT=cp
 | `FOLIVOX_AUDIOBOOKS` (compose) | volume `folivox-audiobooks` | Absolute host folder for finished audiobooks (for example `/srv/audiobooks`). Leave it unset to use a Docker volume. |
 | `FOLIVOX_UI_ALLOWED_HOSTS` | any | Comma-separated host names the studio answers to (see Security). |
 | `FOLIVOX_UI_AUTH` | token | `off`: run without a password, for a trusted home network only (see "Without a password"). |
+| `FOLIVOX_MOVED_OUTPUTS` | | Comma-separated folders where another program moves finished audiobooks (for example an uploader that files them away). The studio's Download audio finds a book there by its size and modification time, whatever it is now called. |
 | `FOLIVOX_UI_ALLOWED_NETS` | private ranges | With `FOLIVOX_UI_AUTH=off`: the client networks that may connect (CIDR, comma-separated). |
 | `FOLIVOX_PRELOAD_MODELS` | 0 | `1`: download the models when the container starts. |
 | `FOLIVOX_RUNTIME` | auto | `auto` (PyTorch for now), `pytorch` or `native`. It wins over *Inference runtime* in the studio and over `config.toml` (which lives in the `/data` volume, `/data/config/folivox/config.toml`), so this is the way to set it when the container starts. The native engine cannot use the GPU in Docker Desktop on Windows (see "NVIDIA GPU"); use `pytorch` there. |
