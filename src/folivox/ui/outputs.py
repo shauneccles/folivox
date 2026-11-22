@@ -1,7 +1,13 @@
-"""A book's finished audio: what a render produced, recorded so the studio can offer it again later."""
+"""A book's finished audio: what a render produced, recorded so the studio can offer it again later, and found again
+when something else moved it (an uploader that files finished books away, named in FOLIVOX_MOVED_OUTPUTS)."""
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+MOVED_ENV = "FOLIVOX_MOVED_OUTPUTS"
+_SAME_MTIME = 0.01  # seconds: a rename keeps the mtime; a copy that keeps it (cp -p) matches too
 
 
 def _mp3s(folder: Path) -> list[Path]:
@@ -23,15 +29,31 @@ def record(path: Path, seconds: float | None, chapters: int | None, now: float) 
             "chapters": chapters, "at": now}
 
 
-def locate(rec: dict) -> Path | None:
-    """The recorded output where it was written, unchanged in size; None when it is gone or was replaced."""
+def moved_dirs(env: Mapping[str, str] = os.environ) -> list[Path]:
+    return [Path(p.strip()) for p in env.get(MOVED_ENV, "").split(",") if p.strip()]
+
+
+def locate(rec: dict, moved: Sequence[Path] = ()) -> Path | None:
+    """The recorded output where it was written, unchanged; else a file directly in one of ``moved`` with the same size
+    and mtime (newest first), whatever its name now. A folder of mp3s is only ever found where it was written."""
     path = Path(rec["path"])
     try:
         if path.exists() and _size_mtime(path)[0] == rec["bytes"]:
             return path
     except OSError:
         pass
-    return None
+    if rec.get("dir"):
+        return None
+    found = []
+    for folder in moved:
+        try:
+            for p in folder.iterdir():
+                st = p.stat()
+                if p.is_file() and st.st_size == rec["bytes"] and abs(st.st_mtime - rec["mtime"]) <= _SAME_MTIME:
+                    found.append((st.st_mtime, p))
+        except OSError:
+            continue
+    return max(found)[1] if found else None
 
 
 def summary(rec: dict | None, found: Path | None) -> dict | None:

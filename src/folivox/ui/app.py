@@ -359,7 +359,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
 
     def audio_record(book_id: str) -> tuple[dict | None, Path | None]:
         rec = library_read().get(Path(book_id).name, {}).get("output")
-        return (rec, outputs.locate(rec)) if isinstance(rec, dict) else (None, None)
+        return (rec, outputs.locate(rec, outputs.moved_dirs())) if isinstance(rec, dict) else (None, None)
 
     def with_audio(book_id: str, summary: dict) -> dict:
         return {**summary, "audio": outputs.summary(*audio_record(book_id))}

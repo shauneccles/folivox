@@ -49,6 +49,35 @@ def test_locate_gives_none_when_the_file_is_gone(tmp_path):
     assert outputs.locate(rec) is None
 
 
+def test_locate_follows_a_move_under_another_name_by_size_and_mtime(tmp_path):
+    m4b = _file(tmp_path / "Book.m4b", b"x" * 10, 1_700_000_000.5)
+    rec = outputs.record(m4b, seconds=1, chapters=1, now=1)
+    moved = tmp_path / "delivered"
+    _file(moved / "Other.m4b", b"y" * 10, 1_600_000_000.0)          # same size, another mtime: not it
+    target = moved / "Book-1795000000.m4b"
+    moved.mkdir(exist_ok=True)
+    m4b.rename(target)
+    assert outputs.locate(rec, [tmp_path / "missing", moved]) == target
+
+
+
+def test_a_folder_is_not_looked_for_in_the_moved_folders(tmp_path):
+    folder = tmp_path / "out" / "Book"
+    _file(folder / "01.mp3", b"a" * 4, 1_700_000_000.0)
+    rec = outputs.record(folder, seconds=None, chapters=1, now=1)
+    moved = tmp_path / "delivered"
+    moved.mkdir()
+    (folder / "01.mp3").rename(moved / "01.mp3")   # the folder's only mp3, same size and mtime, now loose in moved/
+    folder.rmdir()
+    assert outputs.locate(rec, [moved]) is None
+
+
+
+def test_moved_dirs_reads_the_setting():
+    assert outputs.moved_dirs({outputs.MOVED_ENV: " /a , ,/b/c "}) == [Path("/a"), Path("/b/c")]
+    assert outputs.moved_dirs({}) == []
+
+
 def test_summary(tmp_path):
     m4b = _file(tmp_path / "Book.m4b", b"x" * 10, 1_700_000_000.5)
     rec = outputs.record(m4b, seconds=61.2, chapters=3, now=5.0)
@@ -237,3 +266,16 @@ def test_show_in_folder_for_a_book(studio, tmp_path, monkeypatch):
     run(net, nb["book_id"], tmp_path / "n" / "out")
     r = net.post(f"/api/books/{nb['book_id']}/reveal")
     assert r.status_code == 400 and "another machine" in r.json()["error"]
+
+
+def test_audio_moved_by_another_tool_is_still_offered(tmp_path, monkeypatch):
+    monkeypatch.setenv("FOLIVOX_MOVED_OUTPUTS", str(tmp_path / "out" / "delivered"))
+    c = make_client(tmp_path, monkeypatch)
+    b = upload(c)
+    run(c, b["book_id"], tmp_path / "out")
+    (tmp_path / "out" / "delivered").mkdir()
+    (tmp_path / "out" / "tale.m4b").rename(tmp_path / "out" / "delivered" / "tale-1795000000.m4b")
+    assert audio_of(c, b["book_id"])["name"] == "tale-1795000000.m4b"
+    r = c.get(f"/api/books/{b['book_id']}/audio")
+    assert r.status_code == 200 and r.content == b"m4b-bytes"
+    assert "tale-1795000000.m4b" in r.headers["content-disposition"]
