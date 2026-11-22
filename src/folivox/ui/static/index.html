@@ -594,7 +594,7 @@ dialog ul { padding-inline-start:18px; margin:10px 0; } dialog li { margin:6px 0
   <div id="done-card" class="done-card" hidden>
     <div class="dc-ico">✓</div>
     <div class="dc-body"><div class="dc-title" data-i18n="run.ready">Your audiobook is ready</div><div class="dc-path" id="dc-path"></div><div class="dc-meta mute" id="dc-meta"></div>
-      <div class="row" style="margin-top:10px"><button id="dc-reveal" class="primary" data-i18n="run.show">Show in folder</button><button id="dc-close" class="chip" type="button" data-i18n="run.hide">Hide</button></div></div>
+      <div class="row" style="margin-top:10px"><a id="dc-download" download><button type="button" class="primary" data-i18n="run.download">Download audio</button></a><button id="dc-reveal" type="button" data-i18n="run.show">Show in folder</button><button id="dc-close" class="chip" type="button" data-i18n="run.hide">Hide</button></div></div>
   </div>
   <div id="eng-cloud" class="eng-cloud costcard" hidden>
     <div id="eng-est"></div>
@@ -1680,9 +1680,10 @@ $("#mk-vd-takes").addEventListener("click", async (ev) => {
   } catch (e) { vdMsg(e.message, true); }
 });
 $("#mk-vd-close").onclick = () => { $("#mk-vd").hidden = true; if (VD.audio) VD.audio.pause(); };
-const PAGE_API = 5;
+const PAGE_API = 6;
+let NETWORK = false;  // the studio runs on another computer than this browser: nothing can be shown in its folders
 async function checkServer() {
-  try { const r = await api("/api/ping"); if (!(r.api >= PAGE_API)) $("#stale").hidden = false; }
+  try { const r = await api("/api/ping"); if (!(r.api >= PAGE_API)) $("#stale").hidden = false; NETWORK = !!r.network; drawAudio(); }
   catch (e) { if (e.message === "Not Found") $("#stale").hidden = false; }  // a server too old to have /api/ping
 }
 // ---- the languages of the book: the shares, the voices' gaps (all computed by the server) ------------------------
@@ -1729,6 +1730,8 @@ function setBook(b, keep, lang) {
   if (typeof ENG !== "undefined" && ENG.list.length) engChange(); else if (typeof optionsVisibility === "function") optionsVisibility();
   ["#s-chapters", "#s-engine", "#s-voice", "#s-run"].forEach(s => $(s).classList.remove("disabled"));
   loadVoices(); loadLangs();
+  if (typeof job !== "undefined" && job && job.final && job.book_id !== b.book_id) $("#studio").hidden = true;  // another book's run
+  drawAudio();
 }
 const WEAK_RULELESS = new Set(["cs", "sv", "hi"]);  // measured: the online voice reads numbers less reliably in these
 const engReads = (e, c) => !e || !(e.languages || e.voice_langs) || (e.languages || []).includes(c) || (e.voice_langs || []).includes(c);
@@ -2183,9 +2186,25 @@ $("#pron-listen").onclick = async () => {
 };
 $("#preview").onclick = () => start("preview"); $("#render").onclick = () => start("render");
 $("#dc-close").onclick = () => { $("#done-card").hidden = true; };
-$("#dc-reveal").onclick = () => $("#reveal").click();
+$("#dc-reveal").onclick = async () => { try { await api(`/api/books/${book.book_id}/reveal`, { method: "POST" }); } catch (e) { $("#run-msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; } };
 $("#reveal").onclick = async () => { try { await api(`/api/jobs/${job.id}/reveal`, { method: "POST" }); } catch (e) { $("#run-msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; } };
 $("#cancel").onclick = async () => { $("#cancel").disabled = true; await api(`/api/jobs/${job.id}/cancel`, { method: "POST" }); };
+// The open book's audio: the last render of it that finished, recorded by the server, so the card and its download are
+// there after a reload, a restart or a visit to another book, and never for a book that has none.
+function drawAudio() {
+  const a = typeof book !== "undefined" && book ? book.audio : null;
+  $("#done-card").hidden = !a; $("#runbar").classList.toggle("redo", !!a); setRenderLabel();
+  if (!a) return;
+  $("#dc-path").textContent = a.name;
+  $("#dc-meta").textContent = [a.seconds ? t("ph.ofaudio", { t: fmtClock(a.seconds) }) : "", a.chapters ? t("run.chapters", { n: a.chapters }) : "",
+    `${dec(a.bytes / 1e9, 2)} ${t("u.gb")}`].filter(Boolean).join(" · ");
+  $("#dc-download").href = tok(`/api/books/${book.book_id}/audio`); $("#dc-download").download = a.name;
+  $("#dc-reveal").hidden = NETWORK;
+}
+async function refreshAudio(bookId) {  // a render of this book just finished: ask the server what it recorded
+  try { const r = await api(`/api/books/${bookId}/chapters`); if (book && book.book_id === bookId) book.audio = r.audio; } catch (e) { /* keep what the page has */ }
+  drawAudio();
+}
 const setRenderLabel = () => { const redo = $("#runbar").classList.contains("redo"); $("#render").textContent = t(redo ? "run.again" : "run.render"); $("#render").title = redo ? t("run.again.title") : ""; };
 function busy(on) { ["#preview", "#render"].forEach(s => $(s).disabled = on); $("#cancel").disabled = !on; }
 const log = (text, cls = "") => { const l = $("#log"); const d = document.createElement("div"); d.className = cls; d.textContent = text; l.append(d); l.scrollTop = l.scrollHeight; };
@@ -2237,6 +2256,8 @@ function end(state) {
   if (state === "done") { setStage(STAGES.length); $("#overall").style.width = "100%"; $("#pct").textContent = "100"; }
   $("#now-time").textContent = ""; updateTiles();
   if (state === "done" || state === "cancelled") loadReview(job);
+  if (book && job.book_id && job.book_id !== book.book_id) $("#studio").hidden = true;  // a run of another book
+  if (!(state === "done" && job.kind === "render")) drawAudio();  // a render that finished redraws once the server says what it wrote
 }
 // Fragments whose best take still fails QA after every retake (and split): a short list for a human to listen to
 let rplayer = null;
@@ -2420,10 +2441,8 @@ function handle(ev) {
         $("#pv-play").hidden = !lane; $("#reveal").hidden = true; $("#now-actions").hidden = false; syncPv();
       } else {
         setPhase(t("ph.finished"), ev.result, "done"); $("#wave").className = "wave done"; $("#hero-status").textContent = t("hero.saved"); $("#run-msg").textContent = "";
-        $("#pv-play").hidden = true; $("#reveal").hidden = false;
-        $("#dc-path").textContent = ev.result || ""; $("#dc-meta").textContent = [S.audio ? t("ph.ofaudio", { t: fmtClock(S.audio) }) : "", t("ph.renderedin", { t: fmtClock(S.tLast - S.t0) })].filter(Boolean).join(" · ");
-        $("#done-card").hidden = false; $("#runbar").classList.add("redo"); setRenderLabel();
-        $("#done-card").scrollIntoView({ behavior: "smooth", block: "center" });
+        $("#pv-play").hidden = true; $("#reveal").hidden = NETWORK;
+        refreshAudio(job.book_id).then(() => { if (!$("#done-card").hidden) $("#done-card").scrollIntoView({ behavior: "smooth", block: "center" }); });
       } break;
     case "cancelled": log(ev.message || t("log.stopped")); end("cancelled"); setPhase(ev.reason === "cost_cap" ? t("ph.capreached") : t("ph.stopped"), ev.message || t("ph.stoppedhint"), "");
       $("#hero-status").textContent = ev.reason === "cost_cap" ? t("hero.cap") : t("ph.stopped"); $("#run-msg").textContent = ev.reason === "cost_cap" ? ev.message : t("run.stopped"); break;
