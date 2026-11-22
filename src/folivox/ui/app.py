@@ -11,9 +11,11 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 import urllib.parse
 import uuid
+import zipfile
 from pathlib import Path
 
 from platformdirs import user_data_dir
@@ -27,13 +29,13 @@ from folivox import voices as catalog
 from folivox.book import BlockKind
 from folivox.pipeline import QA_LEVELS, RenderOptions
 from folivox.text import pronounce as pronunciations
-from folivox.ui import PRIVATE_NETS, fish_routes, lifecycle, markup_routes, runtime_routes
+from folivox.ui import PRIVATE_NETS, fish_routes, lifecycle, markup_routes, outputs, runtime_routes
 from folivox.ui.jobs import JobManager, chapter_files
 
 STATIC = Path(__file__).parent / "static"
 # Bumped when the page starts using a route that servers started before the update do not have: the page asks
 # /api/ping and, if the server is older, tells the user to restart it.
-API_LEVEL = 5
+API_LEVEL = 6
 MAX_UPLOAD = 200 * 1024 * 1024
 PREVIEW_CHARS = 600
 
@@ -72,6 +74,55 @@ def _chapters(book, depth: int) -> list[dict]:
     cps = book.chars / book.estimated_seconds if book.estimated_seconds else 14.0
     return [{"n": i, "title": ch.title, "chars": ch.chars, "seconds": ch.chars / cps}
             for i, ch in enumerate(book.chapters(depth), 1)]
+
+
+def _open_in_file_manager(target: Path) -> None:
+    import subprocess
+    import sys
+
+    if sys.platform == "darwin":
+        cmd = ["open", "-R", str(target)]
+    elif sys.platform == "win32":
+        cmd = ["explorer", f"/select,{target}"]
+    else:
+        cmd = ["xdg-open", str(target if target.is_dir() else target.parent)]
+    subprocess.Popen(cmd)  # noqa: S603 — fixed argv, the path is a job's or a book's own recorded output
+
+
+class _ZipSink:
+    """A write-only stream zipfile can write to (it adds data descriptors when it cannot seek); what is written is
+    handed out in pieces."""
+
+    def __init__(self):
+        self.parts: list[bytes] = []
+        self.pos = 0
+
+    def write(self, b) -> int:
+        self.parts.append(bytes(b))
+        self.pos += len(b)
+        return len(b)
+
+    def tell(self) -> int:
+        return self.pos
+
+    def flush(self) -> None:
+        pass
+
+    def take(self) -> bytes:
+        out, self.parts = b"".join(self.parts), []
+        return out
+
+
+def _zip_stream(files: list[Path], chunk: int = 1 << 20):
+    """A zip of ``files`` (stored: mp3 does not compress), produced as it is sent."""
+    sink = _ZipSink()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_STORED) as zf:
+        for f in files:
+            with open(f, "rb") as src, zf.open(zipfile.ZipInfo.from_file(f, f.name), "w", force_zip64=True) as dst:
+                while data := src.read(chunk):
+                    dst.write(data)
+                    yield sink.take()
+    yield sink.take()
 
 
 def _book_summary(book_id: str, book, depth: int = 2, cover: str = "") -> dict:
@@ -225,7 +276,8 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         from folivox import __version__
 
         return JSONResponse({"app": "folivox-studio", "api": API_LEVEL, "version": __version__, "pid": os.getpid(),
-                             "busy": state.manager.busy() or bool(lifecycle.activity(state)["markup"])})
+                             "busy": state.manager.busy() or bool(lifecycle.activity(state)["markup"]),
+                             "network": network})
 
     async def get_activity(request: Request):
         """The long work the server is doing, so the page can warn before it closes and show it again on reopening."""
@@ -270,14 +322,47 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         except (OSError, ValueError):
             return {}
 
-    def library_note(book_id: str, book, path: Path) -> None:
-        """Remember a book (title, author, language, size) and that it was used just now."""
-        lib = library_read()
-        lib[book_id] = {"title": book.title, "author": book.author, "lang": book.lang,
-                        "chars": sum(len(b.text) for c in book.chapters(2) for b in c.blocks),
-                        "name": path.name, "used": time.time(), "warnings": list(getattr(book, "warnings", []) or [])}
+    library_lock = threading.Lock()  # a render's end records its audio from the job's thread
+
+    def library_write(lib: dict) -> None:
         state.data_dir.mkdir(parents=True, exist_ok=True)
-        library_file().write_text(json.dumps(lib, ensure_ascii=False), encoding="utf-8")
+        part = library_file().with_suffix(".json.part")
+        part.write_text(json.dumps(lib, ensure_ascii=False), encoding="utf-8")
+        os.replace(part, library_file())
+
+    def library_note(book_id: str, book, path: Path) -> None:
+        """Remember a book (title, author, language, size) and that it was used just now; its audio stays recorded."""
+        with library_lock:
+            lib = library_read()
+            entry = {"title": book.title, "author": book.author, "lang": book.lang,
+                     "chars": sum(len(b.text) for c in book.chapters(2) for b in c.blocks),
+                     "name": path.name, "used": time.time(), "warnings": list(getattr(book, "warnings", []) or [])}
+            if isinstance(lib.get(book_id), dict) and "output" in lib[book_id]:
+                entry["output"] = lib[book_id]["output"]
+            lib[book_id] = entry
+            library_write(lib)
+
+    def note_output(job) -> None:
+        """A finished render (not a preview) of a book: what it wrote becomes the book's audio."""
+        if job.kind != "render" or not job.result or not Path(job.result).exists():
+            return
+        built = [e for e in job.events if e.get("type") == "chapter"]
+        rec = outputs.record(Path(job.result), seconds=round(sum(e.get("duration", 0) for e in built), 1) or None,
+                             chapters=len(built) or None, now=time.time())
+        with library_lock:
+            lib = library_read()
+            if isinstance(lib.get(job.book_id), dict):
+                lib[job.book_id]["output"] = rec
+                library_write(lib)
+
+    state.manager.on_done = note_output
+
+    def audio_record(book_id: str) -> tuple[dict | None, Path | None]:
+        rec = library_read().get(Path(book_id).name, {}).get("output")
+        return (rec, outputs.locate(rec)) if isinstance(rec, dict) else (None, None)
+
+    def with_audio(book_id: str, summary: dict) -> dict:
+        return {**summary, "audio": outputs.summary(*audio_record(book_id))}
 
     def markup_state(book_id: str) -> dict:
         """What the studio's markup file for this book holds, without reading the book."""
@@ -304,7 +389,8 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
                     info["used"] = (state.data_dir / "uploads" / bid).stat().st_mtime
                 except Exception:  # noqa: BLE001 — an unreadable upload does not belong in the list
                     continue
-            out.append({"book_id": bid, **info, "markup": markup_state(bid)})
+            out.append({"book_id": bid, **{k: v for k, v in info.items() if k != "output"},
+                        "markup": markup_state(bid), "audio": outputs.summary(*audio_record(bid))})
         out.sort(key=lambda x: x.get("used", 0), reverse=True)
         return JSONResponse({"books": out})
 
@@ -314,7 +400,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         entry = await asyncio.to_thread(state.book, bid)
         library_note(bid, entry["book"], entry["path"])
         write_session({"book_id": bid})
-        return JSONResponse(_book_summary(bid, entry["book"], cover=cover_kind(bid, entry["book"])))
+        return JSONResponse(with_audio(bid, _book_summary(bid, entry["book"], cover=cover_kind(bid, entry["book"]))))
 
     async def remove_book(request: Request):
         """Forget a book: the uploaded copy and everything the studio keeps for it (markup, characters, pronunciations,
@@ -378,7 +464,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         state.books[book_id] = {"book": book, "path": path}
         library_note(book_id, book, path)
         write_session({"book_id": book_id})  # the last uploaded book survives a reload even before any other change
-        return JSONResponse(_book_summary(book_id, book, cover=cover_kind(book_id, book)))
+        return JSONResponse(with_audio(book_id, _book_summary(book_id, book, cover=cover_kind(book_id, book))))
 
     async def paste_text(request: Request):
         """A book made of pasted text (an article, a note): stored as a .txt so it is read like any upload."""
@@ -415,7 +501,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         state.books[book_id] = {"book": book, "path": path}
         library_note(book_id, book, path)
         write_session({"book_id": book_id})
-        return JSONResponse(_book_summary(book_id, book, cover=cover_kind(book_id, book)))
+        return JSONResponse(with_audio(book_id, _book_summary(book_id, book, cover=cover_kind(book_id, book))))
 
     # ---- book details shown in the player (title, author, narrator, series…) -------------------------
     META_FIELDS = {"title": 300, "author": 300, "narrator": 300, "series": 300, "series_part": 20, "year": 20,
@@ -694,7 +780,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
                 raise ApiError(str(e)) from None
         depth = int(request.query_params.get("depth", 2))
         bid = request.path_params["book_id"]
-        return JSONResponse(_book_summary(bid, book, depth, cover_kind(bid, book)))
+        return JSONResponse(with_audio(bid, _book_summary(bid, book, depth, cover_kind(bid, book))))
 
     def write_session(body: dict) -> None:
         """Atomic, so a crash or two writers never leave a half-written file that would reset the page."""
@@ -1179,22 +1265,39 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
 
     async def job_reveal(request: Request):
         """Show the finished file in the system file manager (only the result of a job of this server)."""
-        import subprocess
-        import sys
-
         if network:
             raise ApiError("The studio runs on another machine: find the file in the output folder", 400)
         job = get_job(request)
         if job.state != "done" or not job.result or not Path(job.result).exists():
             raise ApiError("Nothing to show yet", 404)
-        target = Path(job.result)
-        if sys.platform == "darwin":
-            cmd = ["open", "-R", str(target)]
-        elif sys.platform == "win32":
-            cmd = ["explorer", f"/select,{target}"]
-        else:
-            cmd = ["xdg-open", str(target if target.is_dir() else target.parent)]
-        subprocess.Popen(cmd)  # noqa: S603 — fixed argv, path comes from our own job result
+        _open_in_file_manager(Path(job.result))
+        return JSONResponse({"ok": True})
+
+    def book_audio_path(request: Request) -> Path:
+        found = audio_record(request.path_params["book_id"])[1]
+        if found is None:
+            raise ApiError("No finished audio for this book: render it (again) to make one", 404)
+        return found
+
+    async def book_audio(request: Request):
+        """The book's last finished render, as a download: the m4b, or the mp3 folder as a zip (stored, not
+        recompressed). Only ever the path recorded for this book; the request names no path."""
+        found = await asyncio.to_thread(book_audio_path, request)
+        if not found.is_dir():
+            media = "audio/mp4" if found.suffix.lower() in (".m4b", ".m4a") else "application/octet-stream"
+            return FileResponse(found, media_type=media, filename=found.name, content_disposition_type="attachment")
+        name = found.name + ".zip"
+        quoted = urllib.parse.quote(name)
+        return StreamingResponse(_zip_stream(sorted(p for p in found.glob("*.mp3") if p.is_file())),
+                                 media_type="application/zip",
+                                 headers={"Content-Disposition": f"attachment; filename*=utf-8''{quoted}"})
+
+    async def book_reveal(request: Request):
+        """Show the book's audio in the file manager of the computer the studio runs on."""
+        if network:
+            raise ApiError("The studio runs on another machine: find the file in the output folder", 400)
+        target = await asyncio.to_thread(book_audio_path, request)
+        _open_in_file_manager(target)
         return JSONResponse({"ok": True})
 
     async def job_chapter(request: Request):
@@ -1802,6 +1905,8 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         Route("/api/books/{book_id}", remove_book, methods=["DELETE"]),
         Route("/api/books/text", paste_text, methods=["POST"]),
         Route("/api/books/{book_id}/chapters", book_chapters),
+        Route("/api/books/{book_id}/audio", book_audio),
+        Route("/api/books/{book_id}/reveal", book_reveal, methods=["POST"]),
         Route("/api/books/{book_id}/meta", get_meta),
         Route("/api/books/{book_id}/meta", put_meta, methods=["PUT"]),
         Route("/api/books/{book_id}/markup", get_markup),

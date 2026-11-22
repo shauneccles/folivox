@@ -121,6 +121,19 @@ class JobManager:
         self.gen_current: Job | None = None  # a voice-generation job; never shown as the render job
         self.jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
+        # Called with a job that finished done, before its "done" event, so a page that reads the book on that event
+        # finds what the hook recorded. Its failures are logged and never fail the job.
+        self.on_done: Callable[[Job], None] | None = None
+
+    def _done(self, job: Job) -> None:
+        if self.on_done is None:
+            return
+        try:
+            self.on_done(job)
+        except Exception:  # noqa: BLE001 — the audio is written; a bookkeeping failure must not turn it into an error
+            from folivox import diag
+
+            diag.event("job done hook failed", level=40, exc_info=True, job=job.id)
 
     def busy(self) -> bool:
         return any(j is not None and j.state == "running" for j in (self.current, self.gen_current))
@@ -207,6 +220,7 @@ class JobManager:
         if state == "done":
             job.result = data["result"]
             diag.event("job finished", job=job.id, seconds=secs)
+            self._done(job)
             job.finish("done", "done", result=job.result)
         elif state == "cancelled":
             diag.event("job cancelled", job=job.id, seconds=secs)
@@ -228,6 +242,7 @@ class JobManager:
             result = render(book, job.opts, UIEvents(job))
             job.result = str(result)
             diag.event("job finished", job=job.id, seconds=round(time.time() - t0, 1))
+            self._done(job)
             job.finish("done", "done", result=job.result)
         except CostCapReached as e:
             diag.event("job stopped at the spending cap", job=job.id)
