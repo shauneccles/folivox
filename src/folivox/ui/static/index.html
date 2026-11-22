@@ -2228,7 +2228,8 @@ function newStudio(j) {
   S = { job: j, lanes: [], keys: new Map(), stage: 0, t0: null, tFrag: null, tProg: null, totalChars: 0, doneChars: 0, sessChars: 0,
         totalFrags: 0, doneFrags: 0, audio: 0, synthSecs: 0, retakes: 0, phase: t("ph.starting"), phaseSince: nowSec(), finished: null,
         activeLane: -1, dl: null, dirty: new Set() };
-  $("#studio").hidden = false; $("#done-card").hidden = true; $("#runbar").classList.remove("redo"); setRenderLabel();
+  $("#studio").hidden = false;
+  if (!book || j.book_id === book.book_id) { $("#done-card").hidden = true; $("#runbar").classList.remove("redo"); setRenderLabel(); }  // another book's run leaves this one's card
   $("#stages").innerHTML = STAGES.map(([id, n]) => `<span class="stage" data-s="${id}">${t(n)}</span>`).join("");
   $("#wave").innerHTML = "<i></i>".repeat(30);
   [...$("#wave").children].forEach((b, i) => b.style.animationDelay = (-(i * 0.09) % 1.1).toFixed(2) + "s");

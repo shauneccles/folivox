@@ -275,7 +275,25 @@ def test_audio_moved_by_another_tool_is_still_offered(tmp_path, monkeypatch):
     run(c, b["book_id"], tmp_path / "out")
     (tmp_path / "out" / "delivered").mkdir()
     (tmp_path / "out" / "tale.m4b").rename(tmp_path / "out" / "delivered" / "tale-1795000000.m4b")
-    assert audio_of(c, b["book_id"])["name"] == "tale-1795000000.m4b"
+    assert audio_of(c, b["book_id"])["name"] == "tale.m4b"   # the name it was written under, not the mover's
     r = c.get(f"/api/books/{b['book_id']}/audio")
     assert r.status_code == 200 and r.content == b"m4b-bytes"
-    assert "tale-1795000000.m4b" in r.headers["content-disposition"]
+    assert 'filename="tale.m4b"' in r.headers["content-disposition"]
+
+
+def test_removing_a_book_keeps_the_others_audio_and_replaces_the_library_whole(tmp_path, monkeypatch):
+    c = make_client(tmp_path, monkeypatch)
+    b = upload(c)
+    run(c, b["book_id"], tmp_path / "out")
+    other = upload(c, OTHER, "sea.txt")
+    written = []
+    real = Path.write_text
+
+    def spy(self, *a, **k):
+        written.append(self.name)
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    assert c.delete(f"/api/books/{other['book_id']}").status_code == 200
+    assert "library.json" not in written      # a reader never sees it half written: written beside it, then moved in
+    assert audio_of(c, b["book_id"])["name"] == "tale.m4b"

@@ -57,8 +57,8 @@ def locate(rec: dict, moved: Sequence[Path] = ()) -> Path | None:
 
 
 def summary(rec: dict | None, found: Path | None) -> dict | None:
-    """What the page shows: the file's name as found, never the server's path."""
+    """What the page shows: the name the render wrote it under (a mover may have renamed it), not the server path."""
     if rec is None or found is None:
         return None
-    return {"name": found.name + (".zip" if found.is_dir() else ""), "bytes": rec["bytes"], "seconds": rec["seconds"],
-            "chapters": rec["chapters"], "at": rec["at"], "zip": found.is_dir()}
+    return {"name": Path(rec["path"]).name + (".zip" if found.is_dir() else ""), "bytes": rec["bytes"],
+            "seconds": rec["seconds"], "chapters": rec["chapters"], "at": rec["at"], "zip": found.is_dir()}

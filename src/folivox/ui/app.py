@@ -420,9 +420,10 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
             for f in (d.glob(pattern) if d.is_dir() else []):
                 f.unlink(missing_ok=True)
         state.books.pop(bid, None)
-        lib = library_read()
-        if lib.pop(bid, None) is not None:
-            library_file().write_text(json.dumps(lib, ensure_ascii=False), encoding="utf-8")
+        with library_lock:
+            lib = library_read()
+            if lib.pop(bid, None) is not None:
+                library_write(lib)
         try:
             if json.loads(state.session_file.read_text(encoding="utf-8")).get("book_id") == bid:
                 state.session_file.unlink(missing_ok=True)
@@ -1273,20 +1274,20 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         _open_in_file_manager(Path(job.result))
         return JSONResponse({"ok": True})
 
-    def book_audio_path(request: Request) -> Path:
-        found = audio_record(request.path_params["book_id"])[1]
-        if found is None:
+    def book_audio_path(request: Request) -> tuple[dict, Path]:
+        rec, found = audio_record(request.path_params["book_id"])
+        if rec is None or found is None:
             raise ApiError("No finished audio for this book: render it (again) to make one", 404)
-        return found
+        return rec, found
 
     async def book_audio(request: Request):
         """The book's last finished render, as a download: the m4b, or the mp3 folder as a zip (stored, not
         recompressed). Only ever the path recorded for this book; the request names no path."""
-        found = await asyncio.to_thread(book_audio_path, request)
+        rec, found = await asyncio.to_thread(book_audio_path, request)
+        name = outputs.summary(rec, found)["name"]  # the name it was written under, whatever a mover renamed it to
         if not found.is_dir():
             media = "audio/mp4" if found.suffix.lower() in (".m4b", ".m4a") else "application/octet-stream"
-            return FileResponse(found, media_type=media, filename=found.name, content_disposition_type="attachment")
-        name = found.name + ".zip"
+            return FileResponse(found, media_type=media, filename=name, content_disposition_type="attachment")
         quoted = urllib.parse.quote(name)
         return StreamingResponse(_zip_stream(sorted(p for p in found.glob("*.mp3") if p.is_file())),
                                  media_type="application/zip",
@@ -1296,8 +1297,7 @@ def create_app(token: str | None = None, port: int | None = None, data_dir: Path
         """Show the book's audio in the file manager of the computer the studio runs on."""
         if network:
             raise ApiError("The studio runs on another machine: find the file in the output folder", 400)
-        target = await asyncio.to_thread(book_audio_path, request)
-        _open_in_file_manager(target)
+        _open_in_file_manager((await asyncio.to_thread(book_audio_path, request))[1])
         return JSONResponse({"ok": True})
 
     async def job_chapter(request: Request):
