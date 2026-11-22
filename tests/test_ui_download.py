@@ -42,6 +42,17 @@ def test_locate_refuses_a_file_that_changed_size(tmp_path):
     assert outputs.locate(rec) is None
 
 
+def test_another_file_of_the_same_size_in_its_place_is_not_it(tmp_path):
+    m4b = _file(tmp_path / "Book.m4b", b"x" * 10, 1_700_000_000.5)
+    rec = outputs.record(m4b, seconds=1, chapters=1, now=1)
+    moved = tmp_path / "delivered"
+    moved.mkdir()
+    m4b.rename(moved / "Book-1795000000.m4b")
+    _file(tmp_path / "Book.m4b", b"z" * 10, 1_800_000_000.0)   # a later file, the same length, where it was written
+    assert outputs.locate(rec, [moved]) == moved / "Book-1795000000.m4b"
+    assert outputs.locate(rec) is None
+
+
 def test_locate_gives_none_when_the_file_is_gone(tmp_path):
     m4b = _file(tmp_path / "Book.m4b", b"x" * 10, 1_700_000_000.5)
     rec = outputs.record(m4b, seconds=1, chapters=1, now=1)

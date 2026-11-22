@@ -34,12 +34,15 @@ def moved_dirs(env: Mapping[str, str] = os.environ) -> list[Path]:
 
 
 def locate(rec: dict, moved: Sequence[Path] = ()) -> Path | None:
-    """The recorded output where it was written, unchanged; else a file directly in one of ``moved`` with the same size
-    and mtime (newest first), whatever its name now. A folder of mp3s is only ever found where it was written."""
+    """The recorded output where it was written, unchanged (same size and mtime); else a file directly in one of
+    ``moved`` with the same size and mtime (newest first), whatever its name now. A folder of mp3s is only ever found
+    where it was written."""
     path = Path(rec["path"])
     try:
-        if path.exists() and _size_mtime(path)[0] == rec["bytes"]:
-            return path
+        if path.exists():
+            size, mtime = _size_mtime(path)
+            if size == rec["bytes"] and abs(mtime - rec["mtime"]) <= _SAME_MTIME:
+                return path
     except OSError:
         pass
     if rec.get("dir"):
